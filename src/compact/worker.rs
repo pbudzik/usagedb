@@ -73,7 +73,7 @@ impl CompactionWorker {
                 return Err(err);
             }
         }
-        writer.finish()?;
+        let (_row_count, checksum) = writer.finish()?;
 
         info!(
             "compaction: merged {} inputs into {} ({} rows after dedupe)",
@@ -82,7 +82,7 @@ impl CompactionWorker {
             deduped.len()
         );
 
-        let meta = build_segment_meta(&output_id, &deduped, bucket);
+        let meta = build_segment_meta(&output_id, &deduped, bucket, checksum);
         Ok((
             meta,
             ReplacementRecord {

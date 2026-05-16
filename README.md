@@ -87,18 +87,46 @@ What works end-to-end:
 - Durable batch ingest with idempotent dedupe (blake3 128-bit hash, 7-day TTL)
 - WAL rotation, sealing, and crash recovery (memtable rebuilt from unsealed files)
 - Atomic manifest updates (tmp + rename + parent dir fsync)
-- Background memtable flush → immutable raw segments, partitioned by `bucket = blake3(account_id) % bucket_count`
+- Background memtable flush → immutable columnar raw segments, partitioned by `bucket = blake3(account_id) % bucket_count`
+- Columnar on-disk format with per-column zstd compression and blake3 checksum (see [Segment format](#segment-format))
 - Query executor: raw segments + memtable, filters, group-by, Sum/Count
 - SQL subset parser (`SELECT … FROM usage_events|usage_rollup_hourly WHERE … GROUP BY …`)
 - Compaction worker (read / sort / cold-dedupe / write) — implemented, not yet scheduled
 
 Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 
-- Segments are length-prefixed `bincode` rows, not the spec's columnar format with block metadata, compression, and checksums (the encoding/compression helpers exist but aren't wired into the writer)
+- No per-column dictionary / delta / RLE encodings yet — only `Plain` (bincode + zstd). The format reserves `Encoding` discriminants for these so they can be added without breaking compatibility.
+- No block-level metadata for fine-grained skipping inside a segment; pruning is segment-level only.
 - Hourly rollup builder exists but has no background scheduler — rollup queries fall back to scanning raw events
 - Compaction worker has no scheduler
 - Validation is permissive — `rejected` in the ingest response is always 0
 - No configurable durability mode — strict per-batch fsync only
+
+## Segment format
+
+`.seg` files use a custom columnar layout (`src/storage/segment_format.rs`):
+
+```
+header:
+  magic        b"UDBRAW1\n"  (8 bytes)
+  version      u8 = 1
+  row_count    u32 LE
+  num_columns  u16 LE
+
+per column (×14):
+  name_len         u16 LE
+  name             utf-8 bytes
+  encoding         u8  (0 = Plain)
+  codec            u8  (0 = None, 1 = Zstd, 2 = Lz4)
+  compressed_len   u32 LE
+  compressed_bytes bytes
+
+footer:
+  checksum   u64 LE  (low 8 bytes of blake3 over everything above)
+  magic_end  b"UDBEND01"  (8 bytes)
+```
+
+Each column payload before compression is a bincode-serialized `Vec<T>` of the column's native type, so adding a new column is additive and old readers fail loud (missing column → corrupt segment). The checksum is verified on every open.
 
 ## Data model
 
