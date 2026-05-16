@@ -117,7 +117,8 @@ What works end-to-end:
 - Durable batch ingest with idempotent dedupe (blake3 128-bit hash, 7-day TTL)
 - WAL rotation, sealing, and crash recovery (memtable rebuilt from unsealed files)
 - Atomic manifest updates (tmp + rename + parent dir fsync)
-- Background memtable flush → immutable columnar raw segments, partitioned by `bucket = blake3(account_id) % bucket_count`
+- Background memtable flush → immutable columnar raw segments, partitioned by `bucket = blake3(account_id) % bucket_count`, written in canonical billing order `(account, product, meter, model, ts)` (sort-on-flush) so compaction is cheaper and dictionary encoding compresses better
+- Exclusive process lock (`db_root/LOCK` via `flock`) — prevents server + admin commands from racing on the same database
 - Columnar on-disk format with per-column zstd compression and blake3 checksum (see [Segment format](#segment-format))
 - Background hourly rollup scheduler — seals completed hours into per-bucket rollup segments, advances the manifest watermark atomically, query path routes `RollupHourly` through rollups with raw fallback for the open-period tail
 - Background compaction scheduler — merges small per-bucket segments into a single output, applies the `ReplacementRecord` to the manifest, deletes old files after a configurable reader grace period (spec §15.3)
@@ -144,7 +145,6 @@ db_root/
 
 Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 
-- No RLE encoding yet (used for `kind`-style low-cardinality columns); `Plain` + zstd handles it adequately.
 - No block-level metadata for fine-grained skipping inside a segment; pruning is segment-level only.
 - Rollup segments still use length-prefixed bincode (not the columnar format) — they're tiny so it hasn't been a win yet
 - COUNT semantics differ for `RollupHourly` queries: each rollup row counts as 1, not as the number of underlying events. Use `RawEvents` source for exact event counts.
@@ -178,10 +178,11 @@ Each column payload before compression is encoded based on its declared `encodin
 
 | Encoding | Layout | Used for |
 | --- | --- | --- |
-| `Plain` (0) | bincode-serialized `Vec<T>` | `event_id`, `kind`, `correction_ref`, `dimensions` |
+| `Plain` (0) | bincode-serialized `Vec<T>` | `event_id`, `correction_ref`, `dimensions` |
 | `Dictionary` (1) | bincode `(Vec<String>, Vec<u32>)` — unique values + index per row | `account_id`, `product_id`, `meter_id`, `model_id`, `source`, `unit`, `subscription_id` |
 | `Delta` (2) | bincode `Vec<i64>` of running differences | `timestamp_ms`, `ingested_at_ms` |
 | `Zigzag` (3) | `u32 count` + concatenated zigzag-varints | `quantity` |
+| `Rle` (4) | bincode `Vec<(u8, u32)>` of (value, run_length) | `kind` |
 
 Dictionary collapses ID columns from O(rows × string size) to O(unique values × string size + 4 bytes/row); for ID-heavy workloads this is a 1000× shrink on the column. Delta encoding turns near-monotonic timestamps into small differences that zstd compresses dramatically better. Zigzag-varint packs small i128 quantities into 1–2 bytes instead of 16.
 

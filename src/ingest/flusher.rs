@@ -153,11 +153,20 @@ impl FlusherWorker {
     /// Write one bucket's segment + return its metadata. Returns Err with
     /// a human-readable reason on any failure; the caller cleans up the
     /// partial file and any earlier bucket segments via `rollback_partial`.
+    ///
+    /// Sort-on-flush: events are written in the spec's canonical order
+    /// via `sort_events_canonical`. This matches the order compaction
+    /// would produce, so reading + filtering is monotonic across the
+    /// column families that drive billing queries. Saves a sort pass on
+    /// every later compaction and improves dictionary encoding locality.
     fn write_bucket(
         &self,
         bucket: u32,
         bucket_events: &[UsageEvent],
     ) -> Result<(SegmentMeta, PathBuf), String> {
+        let mut sorted = bucket_events.to_vec();
+        sort_events_canonical(&mut sorted);
+
         let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
         let path = self.state.config.db_root.join(format!("{}.seg", segment_id));
 
@@ -165,7 +174,7 @@ impl FlusherWorker {
             Ok(w) => w,
             Err(e) => return Err(format!("create segment for bucket {}: {}", bucket, e)),
         };
-        for event in bucket_events {
+        for event in &sorted {
             if let Err(e) = writer.write_event(event) {
                 let _ = std::fs::remove_file(&path);
                 return Err(format!("write event to bucket {} segment {}: {}", bucket, segment_id, e));
@@ -179,7 +188,7 @@ impl FlusherWorker {
             }
         };
 
-        Ok((build_segment_meta(&segment_id, bucket_events, bucket, checksum), path))
+        Ok((build_segment_meta(&segment_id, &sorted, bucket, checksum), path))
     }
 }
 
@@ -187,6 +196,24 @@ fn rollback_partial(paths: &[PathBuf]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Sort events into the spec's canonical billing order:
+/// `(account_id, product_id, meter_id, model_id, timestamp_ms)`.
+/// Used by the flusher (sort-on-flush) and also exposed publicly so
+/// tests can verify the algorithm without driving the async pipeline.
+pub fn sort_events_canonical(events: &mut [UsageEvent]) {
+    events.sort_by(|a, b| {
+        a.account_id.0.cmp(&b.account_id.0)
+            .then_with(|| a.product_id.0.cmp(&b.product_id.0))
+            .then_with(|| a.meter_id.0.cmp(&b.meter_id.0))
+            .then_with(|| {
+                let am = a.model_id.as_ref().map(|m| m.0.as_str()).unwrap_or("");
+                let bm = b.model_id.as_ref().map(|m| m.0.as_str()).unwrap_or("");
+                am.cmp(bm)
+            })
+            .then_with(|| a.timestamp_ms.cmp(&b.timestamp_ms))
+    });
 }
 
 /// Build a SegmentMeta covering all events in the batch with the given bucket

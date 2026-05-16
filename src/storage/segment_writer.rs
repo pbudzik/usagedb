@@ -89,9 +89,10 @@ impl RawSegmentWriter {
         // would expand it; Plain + zstd is the right call.
         column_chunks.push((col::EVENT_ID, Encoding::Plain, ser(&self.event_id)?));
 
-        // kind has only 3 possible values; Plain is fine, zstd handles the
-        // repetition. (RLE could squeeze more out — punted for now.)
-        column_chunks.push((col::KIND, Encoding::Plain, ser(&self.kind)?));
+        // kind has only 3 possible values with usually long runs of `Usage`.
+        // RLE compresses long monotonic runs into (value, length) pairs,
+        // which zstd then collapses further.
+        column_chunks.push((col::KIND, Encoding::Rle, encode_rle_u8(&self.kind)?));
 
         // correction_ref is sparse + structured; Plain.
         column_chunks.push((col::CORRECTION_REF, Encoding::Plain, ser(&self.correction_ref)?));
@@ -261,4 +262,31 @@ fn encode_zigzag_varint_i128(values: &[i128]) -> Vec<u8> {
 /// which then varint-encode tightly.
 fn zigzag_i128(n: i128) -> u128 {
     ((n << 1) ^ (n >> 127)) as u128
+}
+
+/// Run-length encode a `Vec<u8>` (used for the `kind` column). Stored as
+/// `Vec<(u8, u32)>` of (value, run_length). Reader expands back to a
+/// flat `Vec<u8>` by repeating each value `run_length` times.
+///
+/// On a 10k-event segment that's all `EventKind::Usage` (kind=0), the
+/// raw column is 10000 bytes; RLE collapses it to one (0, 10000) pair
+/// plus bincode framing — ~10 bytes.
+fn encode_rle_u8(values: &[u8]) -> IoResult<Vec<u8>> {
+    let mut runs: Vec<(u8, u32)> = Vec::new();
+    let mut iter = values.iter().copied();
+    if let Some(first) = iter.next() {
+        let mut current = first;
+        let mut count: u32 = 1;
+        for v in iter {
+            if v == current {
+                count = count.saturating_add(1);
+            } else {
+                runs.push((current, count));
+                current = v;
+                count = 1;
+            }
+        }
+        runs.push((current, count));
+    }
+    ser(&runs)
 }
