@@ -1,6 +1,6 @@
 [package]
 name = "usagedb"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "Embedded append-only usage database for AI billing workloads"
