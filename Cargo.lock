@@ -1208,7 +1208,6 @@ dependencies = [
  "hyper",
  "lz4_flex",
  "memmap2",
- "parking_lot",
  "proptest",
  "serde",
  "serde_json",

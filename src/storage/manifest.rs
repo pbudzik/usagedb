@@ -59,15 +59,26 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn save(&self, db_root: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let manifest_path = db_root.join("manifest.json");
         let tmp_path = db_root.join("manifest.json.tmp");
-        std::fs::write(&tmp_path, json)?;
-        let file = std::fs::File::open(&tmp_path)?;
-        file.sync_all()?;
-        std::fs::rename(tmp_path, manifest_path)?;
-        // Fsync parent directory to ensure the rename is persisted (spec §14 step 7)
+
+        // Write + sync on a single fd before rename. Previous code used
+        // fs::write (no fsync) and then re-opened the file read-only to
+        // sync — that works on Linux because sync_all flushes the inode's
+        // dirty pages via any fd, but the contract is shakier on other
+        // platforms. This is the standard atomic-write recipe.
+        {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            // file dropped here, closing the fd before rename
+        }
+        std::fs::rename(&tmp_path, &manifest_path)?;
+
+        // Fsync the parent directory so the rename is durable (spec §14 step 7).
         let parent = std::fs::File::open(db_root)?;
         parent.sync_all()?;
         Ok(())

@@ -44,21 +44,27 @@ Module map:
 | `src/ingest/` | WAL, memtable, hot dedupe, flusher worker |
 | `src/storage/` | Manifest, segment writer/reader, encoding helpers |
 | `src/query/` | SQL subset parser, plan, executor |
-| `src/rollup/` | Hourly rollup builder (not yet scheduled) |
-| `src/compact/` | Compaction planner + worker (not yet scheduled) |
+| `src/rollup/` | Hourly rollup builder + background scheduler |
+| `src/compact/` | Compaction planner + worker + background scheduler |
 | `src/runtime/` | Config, app state, startup recovery |
 | `src/model/` | Event schema, IDs, dimensions |
 
 ## HTTP API
 
+Spec-aligned routes (§9.1, §12.2, §12.3):
+
 ```
-POST /v1/ingest      { "events": [UsageEvent, ...] }
-POST /v1/query/json  { "source", "account_id", "from", "to", "group_by", "filters", "metrics" }
-POST /v1/query/sql   { "query": "SELECT meter_id, SUM(quantity) FROM usage_events WHERE account_id = '...' GROUP BY meter_id" }
+POST /v1/usage/batch                            { "events": [UsageEvent, ...] }
+GET  /v1/accounts/{account_id}/usage            ?from&to&group_by&product_id&meter_id&model_id&source
+GET  /v1/accounts/{account_id}/usage/events     ?from&to&meter_id&product_id
+POST /v1/query/json                             { "source", "account_id", "from", "to", "group_by", "filters", "metrics" }
+POST /v1/query/sql                              { "query": "SELECT meter_id, SUM(quantity) FROM usage_events WHERE account_id = '...' GROUP BY meter_id" }
 GET  /health
 ```
 
-`from` / `to` are RFC 3339. Supported `metrics`: `sum`, `count`. Supported group keys: column names (`account_id`, `product_id`, `meter_id`, `model_id`, `source`, `unit`), `hour_start_ms`, `day`, or any dimension key.
+`from` / `to` are RFC 3339. Supported `metrics`: `sum`, `count`. Supported group keys: column names (`account_id`, `product_id`, `meter_id`, `model_id`, `source`, `unit`), `hour_start_ms`, `day`, or any dimension key. The account-usage GET defaults `source=rollup` for fast monthly totals; pass `source=raw` to force a raw scan.
+
+Ingest response counts `accepted`, `duplicates` (same id + same payload), `conflicts` (same id + different payload — surfaces silent collector bugs), and `rejected` (validation failures: missing required IDs, non-positive timestamp, >16 dimensions, Correction/Retraction without `correction_ref`).
 
 ## Building and running
 
@@ -74,8 +80,10 @@ Configuration is currently hardcoded in `Config::default()` (db_root `./data`, 6
 
 The ingest path runs three phases under a single critical section:
 
-1. **Classify** every event against the dedupe cache without mutating it.
-2. **Append + fsync** the WAL for events classified as new.
+1. **Validate + classify.** Every event is validated (non-empty IDs, positive timestamp, dimension cap, correction-ref-when-needed) and stamped with a server-side `ingested_at_ms`. Surviving events are classified against the dedupe cache without mutating it.
+2. **Append + sync.** The WAL is a `BufWriter<File>`; `append_batch` writes through the userspace buffer, and the durability mode controls the next step:
+   - `Strict` (default): `flush` + `fsync` before acking — billing-safe.
+   - `Fast`: `flush` only — bytes hit the page cache but no disk round-trip; acceptable for at-least-once upstream retry pipelines.
 3. **Commit** dedupe entries and insert into the memtable.
 
 If step 2 fails, no dedupe state is mutated — client retries do not see false duplicates. The WAL is split across numbered files under `wal/`; on memtable overflow the active file is sealed and a new one is opened, then the flusher writes a segment, persists `last_sealed_wal_id` in the manifest, and deletes WAL files up to that id. Recovery cleans up stragglers and replays any unsealed files into both the dedupe cache and the memtable, so unflushed events survive a crash.
@@ -100,8 +108,7 @@ Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 - No block-level metadata for fine-grained skipping inside a segment; pruning is segment-level only.
 - Rollup segments still use length-prefixed bincode (not the columnar format) — they're tiny so it hasn't been a win yet
 - COUNT semantics differ for `RollupHourly` queries: each rollup row counts as 1, not as the number of underlying events. Use `RawEvents` source for exact event counts.
-- Validation is permissive — `rejected` in the ingest response is always 0
-- No configurable durability mode — strict per-batch fsync only
+- `DurabilityMode::Balanced` (group commit, spec §9.3) is not yet implemented — only `Strict` and `Fast`.
 
 ## Segment format
 

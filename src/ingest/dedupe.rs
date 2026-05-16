@@ -121,21 +121,19 @@ impl HotDedupe {
         self.order.push_back((event_id_hash, first_seen_ms));
     }
 
-    /// Remove entries older than `ttl_ms` from the front of the insertion queue.
+    /// Remove entries older than `ttl_ms` from the front of the insertion
+    /// queue. The cache only inserts (never updates), so an entry in
+    /// `order` whose timestamp is past the cutoff has the same first_seen
+    /// in `cache` — drop both unconditionally. `order` is monotonically
+    /// increasing so we stop at the first non-stale entry.
     fn evict_expired(&mut self) {
         let cutoff = now_ms() - self.ttl_ms;
         while let Some(&(hash, inserted_at)) = self.order.front() {
-            if inserted_at < cutoff {
-                self.order.pop_front();
-                // Only remove from cache if the entry hasn't been replaced
-                if let Some(entry) = self.cache.get(&hash) {
-                    if entry.first_seen_ms < cutoff {
-                        self.cache.remove(&hash);
-                    }
-                }
-            } else {
-                break; // Order is monotonic, so we can stop early
+            if inserted_at >= cutoff {
+                break;
             }
+            self.order.pop_front();
+            self.cache.remove(&hash);
         }
     }
 

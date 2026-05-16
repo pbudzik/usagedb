@@ -1,6 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Per-batch durability policy (spec §9.3). Balanced (group commit) is
+/// listed in the spec as the production default but is not yet implemented;
+/// callers requesting it get Strict semantics for now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DurabilityMode {
+    /// fsync the WAL before acking. Default — billing-safe.
+    Strict,
+    /// Write to the WAL but don't fsync — relies on OS buffering. Fastest;
+    /// loses tail batches on a host crash. Acceptable for at-least-once
+    /// upstream retry pipelines.
+    Fast,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub db_root: PathBuf,
@@ -32,6 +45,8 @@ pub struct Config {
     /// Trigger compaction when a bucket has more than this many small
     /// segments. Spec §15.2 suggests 16.
     pub compaction_max_small_segments: usize,
+    /// Per-batch WAL durability mode. See `DurabilityMode`.
+    pub durability_mode: DurabilityMode,
 }
 
 impl Default for Config {
@@ -47,6 +62,7 @@ impl Default for Config {
             compaction_tick_interval_secs: 60,
             compaction_grace_ms: 30_000, // 30 seconds; covers worst-case query duration
             compaction_max_small_segments: 16,
+            durability_mode: DurabilityMode::Strict,
         }
     }
 }
