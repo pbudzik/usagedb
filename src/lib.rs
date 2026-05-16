@@ -1,5 +1,6 @@
 pub mod api;
 pub mod compact;
+pub mod export;
 pub mod ingest;
 pub mod model;
 pub mod query;
