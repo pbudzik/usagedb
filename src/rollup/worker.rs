@@ -3,11 +3,22 @@
 //! Watermark contract:
 //!   - The manifest holds `watermarks.hourly_rollup_ms` — the upper bound
 //!     (exclusive) below which every hour has been rolled up.
-//!   - Each tick advances the watermark to `target = floor((now - safety_lag) / 1h) * 1h`.
-//!     Hours strictly below `target` are eligible for rollup.
+//!   - Each tick advances the watermark, but **only** to a target that
+//!     respects three safety bounds (review P0 #1):
+//!       a. `time_target = floor((now - safety_lag) / 1h) * 1h`
+//!       b. if a previous flush is in flight (a sealed WAL file hasn't
+//!          been committed to a raw segment yet), skip this tick
+//!       c. if the memtable holds events, the watermark can advance only
+//!          up to the floor-of-hour of the oldest such event — never past
+//!          unflushed data
+//!   - Stalls prevented: if the memtable's oldest event has been pending
+//!     longer than `memtable_max_age_ms`, the worker force-drains it
+//!     (drain + WAL rotate + queue flush) and skips this tick. The next
+//!     tick sees the flushed state.
 //!   - For each hour in `[current_watermark, target)` we scan all raw
 //!     segments that overlap the hour, aggregate events whose timestamp
-//!     falls inside the hour, and write one rollup segment per bucket.
+//!     falls inside the hour (grouped by bucket from `account_id`), and
+//!     write one rollup segment per bucket.
 //!   - The manifest update (rollup segments + new watermark) is one
 //!     atomic save, so a crash mid-tick leaves the previous watermark
 //!     in place and the next tick re-does the work.
@@ -24,7 +35,7 @@ use crate::model::ids::{AccountId, bucket_for_account};
 use crate::rollup::builder::RollupBuilder;
 use crate::rollup::hourly::HourlyRollupRecord;
 use crate::rollup::writer::RollupSegmentWriter;
-use crate::runtime::state::AppState;
+use crate::runtime::state::{AppState, FlushMessage};
 use crate::storage::manifest::{SegmentKind, SegmentMeta};
 use crate::storage::segment_reader::RawSegmentReader;
 
@@ -34,6 +45,7 @@ pub struct RollupWorker {
     state: AppState,
     safety_lag_ms: i64,
     tick_interval: Duration,
+    memtable_max_age_ms: i64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -41,25 +53,30 @@ pub struct RollupTickStats {
     pub segments_written: usize,
     pub watermark_ms: i64,
     pub hours_processed: usize,
+    /// Set when this tick force-drained the memtable instead of advancing
+    /// the watermark. The next tick should pick up the flushed state.
+    pub forced_flush: bool,
+    /// Set when this tick saw an in-flight flush and waited.
+    pub skipped_for_in_flight: bool,
 }
 
 impl RollupWorker {
-    pub fn new(state: AppState, safety_lag_ms: i64, tick_interval: Duration) -> Self {
-        Self { state, safety_lag_ms, tick_interval }
+    pub fn new(
+        state: AppState,
+        safety_lag_ms: i64,
+        tick_interval: Duration,
+        memtable_max_age_ms: i64,
+    ) -> Self {
+        Self { state, safety_lag_ms, tick_interval, memtable_max_age_ms }
     }
 
-    /// Loop until `shutdown` is notified. Errors from individual ticks are
-    /// logged and the loop continues — the next tick retries any work that
-    /// wasn't committed.
     pub async fn run(self, shutdown: Arc<Notify>) {
         info!(
-            "Rollup worker started (interval={:?}, safety_lag={}ms)",
-            self.tick_interval, self.safety_lag_ms
+            "Rollup worker started (interval={:?}, safety_lag={}ms, memtable_max_age={}ms)",
+            self.tick_interval, self.safety_lag_ms, self.memtable_max_age_ms
         );
         let mut interval = tokio::time::interval(self.tick_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // First tick fires immediately; consume it so we wait a full
-        // interval before doing real work.
         interval.tick().await;
 
         loop {
@@ -72,7 +89,10 @@ impl RollupWorker {
                                 stats.segments_written, stats.hours_processed, stats.watermark_ms
                             );
                         }
-                        Ok(_) => { /* nothing to do */ }
+                        Ok(stats) if stats.forced_flush => {
+                            info!("Rollup tick: force-drained stale memtable");
+                        }
+                        Ok(_) => {}
                         Err(e) => error!("Rollup tick failed: {}", e),
                     }
                 }
@@ -84,27 +104,75 @@ impl RollupWorker {
         }
     }
 
-    /// Do one rollup pass. Public so tests can drive the worker deterministically
-    /// instead of waiting on the interval timer. `now_ms_override` controls the
-    /// "current time" used to compute the target watermark, so tests can drive
-    /// the worker forward without sleeping.
+    /// Do one rollup pass. `now_ms_override` controls the "current time"
+    /// used to compute the target watermark and the memtable-staleness
+    /// check; tests pass an explicit value instead of waiting on the clock.
     pub async fn tick(&self, now_ms_override: i64) -> anyhow::Result<RollupTickStats> {
-        let target_hour = ((now_ms_override - self.safety_lag_ms) / HOUR_MS) * HOUR_MS;
-
-        // Snapshot manifest under the read lock.
-        let (mut current_watermark, raw_segments, rollup_segments, bucket_count) = {
+        // Snapshot the bits we need from the manifest + WAL.
+        let (current_watermark, raw_segments, rollup_segments, bucket_count, last_sealed_wal_id) = {
             let manifest = self.state.manifest.read().await;
             (
                 manifest.watermarks.hourly_rollup_ms,
                 manifest.raw_segments.clone(),
                 manifest.rollup_segments.clone(),
                 manifest.bucket_count.max(1),
+                manifest.last_sealed_wal_id,
             )
         };
+        let active_wal_id = {
+            let wal = self.state.wal.lock().await;
+            wal.active_id
+        };
 
-        // If the watermark is at the epoch but there's actual data, clamp it
-        // forward to the earliest hour any raw segment touches — otherwise
-        // a fresh DB would iterate billions of empty hours.
+        // Safety bound (b): if there are sealed WAL files that haven't yet
+        // been committed to raw segments, those events would be missed by
+        // a watermark advance. Skip and let the flusher catch up.
+        if active_wal_id > last_sealed_wal_id + 1 {
+            return Ok(RollupTickStats {
+                segments_written: 0,
+                watermark_ms: current_watermark,
+                hours_processed: 0,
+                forced_flush: false,
+                skipped_for_in_flight: true,
+            });
+        }
+
+        // Stall prevention: memtable too old → force flush, skip tick.
+        let needs_force_drain = {
+            let memtable = self.state.memtable.lock().await;
+            match memtable.oldest_insert_at_ms() {
+                Some(at) => (now_ms_override - at) >= self.memtable_max_age_ms,
+                None => false,
+            }
+        };
+        if needs_force_drain {
+            self.force_drain_memtable().await?;
+            return Ok(RollupTickStats {
+                segments_written: 0,
+                watermark_ms: current_watermark,
+                hours_processed: 0,
+                forced_flush: true,
+                skipped_for_in_flight: false,
+            });
+        }
+
+        // Safety bound (c): never advance past unflushed memtable data.
+        let memtable_min_ts = {
+            let memtable = self.state.memtable.lock().await;
+            memtable.min_event_timestamp_ms()
+        };
+        let time_target = ((now_ms_override - self.safety_lag_ms) / HOUR_MS) * HOUR_MS;
+        let target_hour = match memtable_min_ts {
+            Some(ts) => {
+                let oldest_hour = (ts / HOUR_MS) * HOUR_MS;
+                time_target.min(oldest_hour)
+            }
+            None => time_target,
+        };
+
+        // Initial-watermark clamp: a fresh DB starts with watermark=0;
+        // skip the empty hours up to where data actually starts.
+        let mut current_watermark = current_watermark;
         if current_watermark == 0 && !raw_segments.is_empty() {
             let earliest = raw_segments.iter().map(|s| s.min_timestamp_ms).min().unwrap_or(0);
             current_watermark = (earliest / HOUR_MS) * HOUR_MS;
@@ -115,12 +183,12 @@ impl RollupWorker {
                 segments_written: 0,
                 watermark_ms: current_watermark,
                 hours_processed: 0,
+                forced_flush: false,
+                skipped_for_in_flight: false,
             });
         }
 
-        // Build the set of (hour_start, bucket) tuples we've already rolled up,
-        // so a crash + restart can't double-count even within the same
-        // watermark window.
+        // Per-(hour, bucket) tuples already rolled up — don't double up.
         let already_rolled: std::collections::HashSet<(i64, u32)> = rollup_segments
             .iter()
             .map(|s| (s.min_timestamp_ms, s.bucket))
@@ -133,10 +201,6 @@ impl RollupWorker {
         while hour < target_hour {
             let hour_end = hour + HOUR_MS;
 
-            // Group records by bucket. We re-derive the bucket from the
-            // event's account_id rather than trusting the segment's bucket
-            // metadata, so that any future compaction that mixes buckets
-            // can't poison the rollup.
             let mut by_bucket: HashMap<u32, RollupBuilder> = HashMap::new();
             for seg in &raw_segments {
                 if seg.max_timestamp_ms < hour || seg.min_timestamp_ms >= hour_end {
@@ -186,8 +250,6 @@ impl RollupWorker {
             }
             manifest.watermarks.hourly_rollup_ms = target_hour;
             if let Err(e) = manifest.save(&self.state.config.db_root) {
-                // Manifest save failed: clean up the segment files we
-                // wrote, since they're now unreferenced.
                 error!("rollup: manifest save failed: {} — cleaning up {} segment files", e, new_segments.len());
                 for (_meta, path) in &new_segments {
                     let _ = std::fs::remove_file(path);
@@ -200,7 +262,32 @@ impl RollupWorker {
             segments_written,
             watermark_ms: target_hour,
             hours_processed,
+            forced_flush: false,
+            skipped_for_in_flight: false,
         })
+    }
+
+    /// Drain the memtable, rotate the WAL, and queue the resulting batch
+    /// for the flusher. Same primitives the ingest path uses when the
+    /// size threshold trips. Called from `tick` when the memtable has
+    /// been sitting too long.
+    async fn force_drain_memtable(&self) -> anyhow::Result<()> {
+        let drained = {
+            let mut wal = self.state.wal.lock().await;
+            let mut memtable = self.state.memtable.lock().await;
+            if memtable.is_empty() {
+                return Ok(());
+            }
+            let events = memtable.drain_all();
+            let sealed_id = wal.rotate()?;
+            FlushMessage { events, sealed_wal_id: sealed_id }
+        };
+        self.state
+            .flush_sender
+            .send(drained)
+            .await
+            .map_err(|e| anyhow::anyhow!("rollup: force-flush channel send failed: {}", e))?;
+        Ok(())
     }
 
     fn write_rollup_segment(
@@ -296,7 +383,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-// Silence unused-import lint when no callers reference UsageEvent in this
-// file directly (the type is reached via RawSegmentReader::read_next).
+// Silence unused-import lint when no callers reference UsageEvent directly.
 #[allow(dead_code)]
 fn _force_usage_event_import_used(_e: &UsageEvent) {}

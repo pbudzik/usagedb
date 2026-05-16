@@ -47,6 +47,12 @@ pub struct Config {
     pub compaction_max_small_segments: usize,
     /// Per-batch WAL durability mode. See `DurabilityMode`.
     pub durability_mode: DurabilityMode,
+    /// Maximum age (ms) a memtable is allowed to hold the oldest pending
+    /// event before the rollup worker force-drains it. Bounds the latency
+    /// from ingest → durable raw segment, and prevents the rollup
+    /// watermark from stalling forever waiting on a slow-to-flush
+    /// memtable (review P0 #1).
+    pub memtable_max_age_ms: i64,
 }
 
 impl Default for Config {
@@ -63,6 +69,7 @@ impl Default for Config {
             compaction_grace_ms: 30_000, // 30 seconds; covers worst-case query duration
             compaction_max_small_segments: 16,
             durability_mode: DurabilityMode::Strict,
+            memtable_max_age_ms: 60_000, // 1 minute — close to rollup_safety_lag_ms
         }
     }
 }

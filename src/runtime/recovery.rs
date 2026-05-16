@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 use crate::storage::manifest::Manifest;
 use crate::ingest::wal::Wal;
-use crate::ingest::dedupe::HotDedupe;
+use crate::ingest::dedupe::{HotDedupe, DEFAULT_TTL_MS};
 use crate::ingest::memtable::Memtable;
 use crate::model::event::UsageEvent;
+use crate::storage::segment_reader::RawSegmentReader;
 use std::io::Result as IoResult;
 use tracing::{info, warn};
 
@@ -95,6 +97,56 @@ impl Recovery {
             }
         }
 
+        // 5. Rebuild dedupe from recent raw segments (review P0 #2).
+        //    The hot cache normally tracks every ack'd event for TTL
+        //    minutes/days. Across a restart, sealed-and-deleted WAL files
+        //    means dedupe entries vanish — so a retry of an event we
+        //    already accepted before the crash would re-bill. Scan
+        //    segments whose max timestamp is within the TTL window and
+        //    re-register their events.
+        let cutoff = now_ms_recovery().saturating_sub(DEFAULT_TTL_MS);
+        let mut segments_scanned = 0usize;
+        let mut events_registered = 0usize;
+        for seg in &manifest.raw_segments {
+            if seg.max_timestamp_ms < cutoff {
+                continue;
+            }
+            let path = self.db_root.join(format!("{}.seg", seg.segment_id));
+            if !path.exists() {
+                warn!(
+                    "recovery: manifest references missing raw segment {} — dedupe will be incomplete for its events",
+                    seg.segment_id
+                );
+                continue;
+            }
+            match RawSegmentReader::new(path) {
+                Ok(mut reader) => {
+                    loop {
+                        match reader.read_next() {
+                            Ok(Some(event)) => {
+                                let (id_hash, payload_hash) = compute_event_hashes(&event);
+                                dedupe.insert_known(id_hash, payload_hash, event.ingested_at_ms);
+                                events_registered += 1;
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                warn!("recovery: error reading segment {}: {}", seg.segment_id, e);
+                                break;
+                            }
+                        }
+                    }
+                    segments_scanned += 1;
+                }
+                Err(e) => warn!("recovery: failed to open segment {}: {}", seg.segment_id, e),
+            }
+        }
+        if segments_scanned > 0 {
+            info!(
+                "Dedupe rebuild: scanned {} recent segments, registered {} events",
+                segments_scanned, events_registered
+            );
+        }
+
         info!(
             "Recovery complete: manifest loaded ({} segments), dedupe rebuilt ({} entries), memtable size {} bytes",
             manifest.raw_segments.len(),
@@ -129,6 +181,13 @@ pub fn compute_event_hashes(event: &UsageEvent) -> (crate::ingest::dedupe::Event
     };
 
     (event_id_hash, payload_hash)
+}
+
+fn now_ms_recovery() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn blake3_u128(data: &[u8]) -> u128 {

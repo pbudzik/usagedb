@@ -3,7 +3,7 @@ use crate::runtime::state::AppState;
 use crate::model::event::{EventKind, UsageEvent};
 use crate::model::dimensions::SmallDimensions;
 use crate::model::ids::{
-    AccountId, EventId, MeterId, ModelId, ProductId, SourceId, SubscriptionId, Unit,
+    AccountId, EventId, MeterId, ModelId, ProductId, SubscriptionId,
 };
 use crate::rollup::hourly::HourlyRollupRecord;
 use crate::rollup::reader::RollupSegmentReader;
@@ -161,8 +161,8 @@ fn rollup_record_to_event(r: &HourlyRollupRecord) -> UsageEvent {
         meter_id: r.meter_id.clone(),
         timestamp_ms: r.hour_start_ms,
         quantity: r.quantity_sum,
-        unit: Unit(String::new()), // not stored in rollup record
-        source: SourceId(String::new()),
+        unit: r.unit.clone(),
+        source: r.source.clone(),
         model_id: r.model_id.clone(),
         dimensions,
         ingested_at_ms: r.last_event_ms,
