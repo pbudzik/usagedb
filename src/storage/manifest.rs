@@ -44,6 +44,11 @@ pub struct Manifest {
     pub rollup_segments: Vec<SegmentMeta>,
     pub compacted_replacements: Vec<ReplacementRecord>,
     pub watermarks: Watermarks,
+    /// Highest WAL file ID whose contents are durably in committed segments.
+    /// WAL files with id <= this can be deleted; files with id > this must be
+    /// replayed on recovery.
+    #[serde(default)]
+    pub last_sealed_wal_id: u64,
 }
 
 impl Manifest {

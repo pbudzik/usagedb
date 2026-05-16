@@ -47,10 +47,10 @@ impl HotDedupe {
         self
     }
 
-    /// Check if an event is a duplicate, and insert it if new.
-    pub fn check_and_insert(&mut self, event_id_hash: u64, payload_hash: u64) -> DedupeResult {
-        self.evict_expired();
-
+    /// Classify an event against the cache without mutating state. Used by
+    /// the ingest hot path to decide whether to WAL-append before committing
+    /// the dedupe entry.
+    pub fn classify(&self, event_id_hash: u64, payload_hash: u64) -> DedupeResult {
         if let Some(existing) = self.cache.get(&event_id_hash) {
             if existing.payload_hash == payload_hash {
                 DedupeResult::ExactDuplicate
@@ -58,27 +58,46 @@ impl HotDedupe {
                 DedupeResult::PayloadConflict
             }
         } else {
-            let now = now_ms();
-            self.cache.insert(
-                event_id_hash,
-                DedupeEntry {
-                    payload_hash,
-                    first_seen_ms: now,
-                },
-            );
-            self.order.push_back((event_id_hash, now));
-
-            // Capacity-based eviction (FIFO)
-            while self.cache.len() > self.max_capacity {
-                if let Some((oldest_hash, _)) = self.order.pop_front() {
-                    self.cache.remove(&oldest_hash);
-                } else {
-                    break;
-                }
-            }
-
             DedupeResult::NewEvent
         }
+    }
+
+    /// Commit a previously-classified `NewEvent` into the cache. Safe to call
+    /// after WAL durability has been established. No-op if a concurrent
+    /// caller already inserted the same hash.
+    pub fn commit(&mut self, event_id_hash: u64, payload_hash: u64) {
+        self.evict_expired();
+        if self.cache.contains_key(&event_id_hash) {
+            return;
+        }
+        let now = now_ms();
+        self.cache.insert(
+            event_id_hash,
+            DedupeEntry {
+                payload_hash,
+                first_seen_ms: now,
+            },
+        );
+        self.order.push_back((event_id_hash, now));
+
+        while self.cache.len() > self.max_capacity {
+            if let Some((oldest_hash, _)) = self.order.pop_front() {
+                self.cache.remove(&oldest_hash);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Convenience wrapper that classifies and (if NewEvent) commits in one
+    /// step. Used by tests; the hot path should call classify + commit
+    /// separately around the WAL append.
+    pub fn check_and_insert(&mut self, event_id_hash: u64, payload_hash: u64) -> DedupeResult {
+        let result = self.classify(event_id_hash, payload_hash);
+        if result == DedupeResult::NewEvent {
+            self.commit(event_id_hash, payload_hash);
+        }
+        result
     }
 
     /// Insert a known event during WAL replay without returning a dedupe result.

@@ -4,6 +4,7 @@ use crate::storage::manifest::Manifest;
 use crate::ingest::wal::Wal;
 use crate::ingest::dedupe::HotDedupe;
 use crate::ingest::memtable::Memtable;
+use crate::model::event::UsageEvent;
 use std::io::Result as IoResult;
 use tracing::{info, warn};
 
@@ -27,14 +28,12 @@ impl Recovery {
 
         // 1. Load manifest
         let manifest_path = self.db_root.join("manifest.json");
-        let manifest = if manifest_path.exists() {
+        let manifest: Manifest = if manifest_path.exists() {
             let data = fs::read_to_string(&manifest_path)?;
             match serde_json::from_str(&data) {
                 Ok(m) => {
-                    info!("Loaded manifest with {} raw segments", {
-                        let m: &Manifest = &m;
-                        m.raw_segments.len()
-                    });
+                    info!("Loaded manifest with {} raw segments",
+                        { let m: &Manifest = &m; m.raw_segments.len() });
                     m
                 }
                 Err(e) => {
@@ -46,6 +45,8 @@ impl Recovery {
             info!("No manifest found, starting fresh");
             Manifest::default()
         };
+
+        let last_sealed_wal_id = manifest.last_sealed_wal_id;
 
         // 2. Remove tmp files
         let tmp_dir = self.db_root.join("tmp");
@@ -60,46 +61,45 @@ impl Recovery {
             }
         }
 
-        // 3. Collect committed segment IDs for WAL filtering
-        let committed_segment_ids: std::collections::HashSet<String> = manifest
-            .raw_segments
-            .iter()
-            .map(|s| s.segment_id.clone())
-            .collect();
+        // 3. Clean up WAL files <= last_sealed_wal_id (their contents are
+        //    already durable in segments). Leftover from a crash between
+        //    segment commit and WAL deletion.
+        let wal_dir = self.db_root.join("wal");
+        if wal_dir.exists() && last_sealed_wal_id > 0 {
+            Wal::delete_files_through(&wal_dir, last_sealed_wal_id)?;
+        }
 
-        // 4. Replay WAL to rebuild dedupe cache and recover unflushed events
-        let wal_path = self.db_root.join("wal.jsonl");
-        let wal_events = Wal::replay(&wal_path)?;
-
+        // 4. Replay WAL files > last_sealed_wal_id: rebuild dedupe AND
+        //    refill the memtable so events are visible and will be
+        //    re-flushed on the next memtable rotation.
         let mut dedupe = HotDedupe::new(dedupe_capacity);
-        let memtable = Memtable::new();
+        let mut memtable = Memtable::new();
 
-        // Rebuild dedupe from all WAL events (they represent the recent history).
-        // Events that are already in committed segments don't need to go to the memtable,
-        // but we still register them in dedupe for conflict detection.
-        use std::hash::{Hash, Hasher};
-        use std::collections::hash_map::DefaultHasher;
-
-        for event in &wal_events {
-            let mut s1 = DefaultHasher::new();
-            event.event_id.hash(&mut s1);
-            let event_id_hash = s1.finish();
-
-            let mut s2 = DefaultHasher::new();
-            let mut ev_clone = event.clone();
-            ev_clone.ingested_at_ms = 0;
-            if let Ok(bytes) = bincode::serialize(&ev_clone) {
-                std::hash::Hash::hash_slice(&bytes, &mut s2);
+        if wal_dir.exists() {
+            let file_ids = Wal::list_files_after(&wal_dir, last_sealed_wal_id)?;
+            let mut total_events = 0usize;
+            for id in &file_ids {
+                let events = Wal::replay_file(&wal_dir, *id)?;
+                for event in events {
+                    let (event_id_hash, payload_hash) = compute_event_hashes(&event);
+                    dedupe.insert_known(event_id_hash, payload_hash, event.ingested_at_ms);
+                    memtable.insert(event);
+                    total_events += 1;
+                }
             }
-            let payload_hash = s2.finish();
-
-            dedupe.insert_known(event_id_hash, payload_hash, event.ingested_at_ms);
+            if !file_ids.is_empty() {
+                info!(
+                    "WAL replay: {} unflushed events recovered into memtable across {} file(s)",
+                    total_events, file_ids.len()
+                );
+            }
         }
 
         info!(
-            "Recovery complete: manifest loaded ({} segments), dedupe rebuilt ({} entries)",
-            committed_segment_ids.len(),
-            dedupe.len()
+            "Recovery complete: manifest loaded ({} segments), dedupe rebuilt ({} entries), memtable size {} bytes",
+            manifest.raw_segments.len(),
+            dedupe.len(),
+            memtable.size_bytes(),
         );
 
         Ok(RecoveryResult {
@@ -108,4 +108,25 @@ impl Recovery {
             memtable,
         })
     }
+}
+
+/// Hash an event for dedupe purposes. Identical to the ingest path so that
+/// replayed events match incoming retries.
+pub fn compute_event_hashes(event: &UsageEvent) -> (u64, u64) {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+
+    let mut s1 = DefaultHasher::new();
+    event.event_id.hash(&mut s1);
+    let event_id_hash = s1.finish();
+
+    let mut s2 = DefaultHasher::new();
+    let mut ev_clone = event.clone();
+    ev_clone.ingested_at_ms = 0;
+    if let Ok(bytes) = bincode::serialize(&ev_clone) {
+        std::hash::Hash::hash_slice(&bytes, &mut s2);
+    }
+    let payload_hash = s2.finish();
+
+    (event_id_hash, payload_hash)
 }
