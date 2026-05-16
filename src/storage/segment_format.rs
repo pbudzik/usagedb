@@ -43,12 +43,29 @@ pub const VERSION: u8 = 1;
 pub enum Encoding {
     /// bincode-serialized `Vec<T>` of the column's native type.
     Plain = 0,
+    /// Dictionary encoding for string columns: `(Vec<String>, Vec<u32>)`
+    /// — unique values + index per row. Used for ID columns that repeat
+    /// heavily (account_id, product_id, meter_id, …). A 10k-event
+    /// segment with 10 distinct accounts costs 10 strings + 10k 4-byte
+    /// indices instead of 10k strings.
+    Dictionary = 1,
+    /// Delta encoding for monotonically-increasing i64 (timestamps).
+    /// Stored as `Vec<i64>` of differences from the previous value;
+    /// zstd compresses small deltas dramatically better than raw ts.
+    Delta = 2,
+    /// Zigzag + varint encoding for i128 quantities. Small values pack
+    /// to ~1-2 bytes instead of 16; signed mapping via zigzag means
+    /// `-1` ≈ same size as `1`.
+    Zigzag = 3,
 }
 
 impl Encoding {
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::Plain),
+            1 => Some(Self::Dictionary),
+            2 => Some(Self::Delta),
+            3 => Some(Self::Zigzag),
             _ => None,
         }
     }
