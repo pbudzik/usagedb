@@ -1,9 +1,15 @@
 use crate::model::event::UsageEvent;
 use std::collections::VecDeque;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Memtable {
     events: VecDeque<UsageEvent>,
     approx_size_bytes: usize,
+    /// Wall-clock timestamp when the oldest currently-buffered event was
+    /// inserted. None when the memtable is empty. Used by the rollup
+    /// worker to detect a memtable that's holding events long enough that
+    /// the watermark would otherwise advance past them (review P0 #1).
+    oldest_insert_at_ms: Option<i64>,
 }
 
 impl Memtable {
@@ -11,11 +17,15 @@ impl Memtable {
         Self {
             events: VecDeque::new(),
             approx_size_bytes: 0,
+            oldest_insert_at_ms: None,
         }
     }
 
     pub fn insert(&mut self, event: UsageEvent) {
         self.approx_size_bytes += Self::estimate_event_size(&event);
+        if self.events.is_empty() {
+            self.oldest_insert_at_ms = Some(now_ms());
+        }
         self.events.push_back(event);
     }
 
@@ -54,9 +64,24 @@ impl Memtable {
         self.events.is_empty()
     }
 
+    /// Wall-clock timestamp at which the oldest currently-buffered event
+    /// was inserted. Used to detect a memtable that's been sitting too
+    /// long without a flush.
+    pub fn oldest_insert_at_ms(&self) -> Option<i64> {
+        self.oldest_insert_at_ms
+    }
+
+    /// Smallest `timestamp_ms` across buffered events. None when empty.
+    /// Used by the rollup worker to keep the watermark from advancing
+    /// past unflushed data.
+    pub fn min_event_timestamp_ms(&self) -> Option<i64> {
+        self.events.iter().map(|e| e.timestamp_ms).min()
+    }
+
     pub fn drain_all(&mut self) -> Vec<UsageEvent> {
         let events = self.events.drain(..).collect();
         self.approx_size_bytes = 0;
+        self.oldest_insert_at_ms = None;
         events
     }
 
@@ -71,4 +96,11 @@ impl Default for Memtable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

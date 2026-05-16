@@ -23,6 +23,8 @@ impl RollupBuilder {
             product_id: event.product_id.clone(),
             meter_id: event.meter_id.clone(),
             model_id: event.model_id.clone(),
+            source: event.source.clone(),
+            unit: event.unit.clone(),
             hour_start_ms: hour_ms,
             dimensions_canonical: dim_canonical.clone(),
         };
@@ -33,6 +35,8 @@ impl RollupBuilder {
             product_id: key.product_id,
             meter_id: key.meter_id,
             model_id: key.model_id,
+            source: key.source,
+            unit: key.unit,
             hour_start_ms: key.hour_start_ms,
             dimensions_canonical: dim_canonical,
             quantity_sum: 0,

@@ -2,7 +2,9 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default TTL of 7 days in milliseconds, covering typical retry windows.
-const DEFAULT_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
+/// Public so the recovery path can use the same window when rebuilding
+/// dedupe from recent raw segments (review P0 #2).
+pub const DEFAULT_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
 
 /// Event identity hash: 128 bits derived from blake3, stable across Rust
 /// versions and large enough that birthday collisions are negligible at

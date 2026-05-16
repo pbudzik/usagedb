@@ -124,7 +124,7 @@ async fn tick_seals_completed_hours_and_advances_watermark() {
     }
 
     // Drive the worker as if "now" is well past hour 101.
-    let worker = RollupWorker::new(state.clone(), 0, Duration::from_secs(30));
+    let worker = RollupWorker::new(state.clone(), 0, Duration::from_secs(30), i64::MAX);
     let stats = worker.tick((101 * HOUR_MS) + 1).await.unwrap();
 
     assert!(stats.segments_written > 0, "tick must write at least one rollup segment");
@@ -154,7 +154,7 @@ async fn second_tick_is_noop_for_the_same_window() {
     let bucket = bucket_for_account(&events[0].account_id, 2);
     commit_segment_directly(&state, &events, bucket).await;
 
-    let worker = RollupWorker::new(state.clone(), 0, Duration::from_secs(30));
+    let worker = RollupWorker::new(state.clone(), 0, Duration::from_secs(30), i64::MAX);
     let first = worker.tick((51 * HOUR_MS) + 1).await.unwrap();
     let segments_after_first = first.segments_written;
     assert!(segments_after_first > 0);
@@ -184,7 +184,7 @@ async fn query_through_rollup_returns_same_sum_as_raw() {
     let bucket = bucket_for_account(&events[0].account_id, 2);
     commit_segment_directly(&state, &events, bucket).await;
 
-    let worker = RollupWorker::new(state.clone(), 0, Duration::from_secs(30));
+    let worker = RollupWorker::new(state.clone(), 0, Duration::from_secs(30), i64::MAX);
     worker.tick((201 * HOUR_MS) + 1).await.unwrap();
 
     let mut metrics = HashMap::new();
@@ -250,7 +250,7 @@ async fn open_hour_remains_visible_via_raw_fallback() {
     commit_segment_directly(&state, &events, bucket).await;
 
     // Tick with now just past h11 → only h10 is sealed; h11 stays open.
-    let worker = RollupWorker::new(state.clone(), 0, Duration::from_secs(30));
+    let worker = RollupWorker::new(state.clone(), 0, Duration::from_secs(30), i64::MAX);
     let stats = worker.tick(h11 + 1).await.unwrap();
     assert_eq!(stats.watermark_ms, h11, "watermark should land on h11 (h10 sealed, h11 open)");
 

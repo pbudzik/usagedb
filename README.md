@@ -86,7 +86,9 @@ The ingest path runs three phases under a single critical section:
    - `Fast`: `flush` only — bytes hit the page cache but no disk round-trip; acceptable for at-least-once upstream retry pipelines.
 3. **Commit** dedupe entries and insert into the memtable.
 
-If step 2 fails, no dedupe state is mutated — client retries do not see false duplicates. The WAL is split across numbered files under `wal/`; on memtable overflow the active file is sealed and a new one is opened, then the flusher writes a segment, persists `last_sealed_wal_id` in the manifest, and deletes WAL files up to that id. Recovery cleans up stragglers and replays any unsealed files into both the dedupe cache and the memtable, so unflushed events survive a crash.
+If step 2 fails, no dedupe state is mutated — client retries do not see false duplicates. The WAL is split across numbered files under `wal/`; on memtable overflow the active file is sealed and a new one is opened, then the flusher writes a segment, persists `last_sealed_wal_id` in the manifest, and deletes WAL files up to that id. Recovery cleans up stragglers, replays any unsealed files into both the dedupe cache and the memtable, **and** scans raw segments within the dedupe TTL window (7 days) to re-register their events — so retries across restart of previously-committed events are detected as duplicates, not accepted as new.
+
+The rollup worker advances the watermark under three safety bounds: (a) `time_target = floor((now - safety_lag) / 1h) * 1h`; (b) skip the tick if a flush is in flight (a sealed WAL file hasn't yet been committed to a raw segment); (c) cap by the floor-of-hour of the oldest event still in the memtable — the watermark never crosses unflushed data. If the memtable holds events older than `memtable_max_age_ms`, the rollup worker force-drains it so the watermark can resume.
 
 ## Status
 

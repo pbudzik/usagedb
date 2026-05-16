@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rollup_tick_interval = Duration::from_secs(config.rollup_tick_interval_secs);
     let rollup_safety_lag_ms = config.rollup_safety_lag_ms;
+    let memtable_max_age_ms = config.memtable_max_age_ms;
     let compaction_tick_interval = Duration::from_secs(config.compaction_tick_interval_secs);
     let compaction_grace_ms = config.compaction_grace_ms;
     let compaction_max_small = config.compaction_max_small_segments;
@@ -64,7 +65,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rollup_shutdown = Arc::new(Notify::new());
     let rollup_shutdown_signal = rollup_shutdown.clone();
-    let rollup_worker = RollupWorker::new(state.clone(), rollup_safety_lag_ms, rollup_tick_interval);
+    let rollup_worker = RollupWorker::new(
+        state.clone(),
+        rollup_safety_lag_ms,
+        rollup_tick_interval,
+        memtable_max_age_ms,
+    );
     let rollup_handle = tokio::spawn(async move {
         rollup_worker.run(rollup_shutdown_signal).await;
     });
