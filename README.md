@@ -108,6 +108,7 @@ What works end-to-end:
 - SQL subset parser is strict — `SUM` accepts only `quantity`, `COUNT` accepts only `*`, ranges distinguish `<`/`<=` and `>`/`>=`, `OR`/`HAVING`/aliases/`SELECT *` are rejected explicitly rather than silently mapped
 - Fail-closed recovery on corrupt manifest (refuses to start instead of silently falling back to an empty manifest)
 - Shutdown drain — `ctrl+c` flushes the memtable before exiting
+- proptest property tests for spec §19 invariants (`tests/properties.rs`): raw=rollup totals, dedupe idempotence under retry, compaction-preserves-sum, recovery-preserves-sum (with and without prior flush), rollup-tick idempotence, payload-conflict detection — 32 randomized cases per property, regenerated on every CI run
 
 Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 
