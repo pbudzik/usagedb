@@ -322,7 +322,7 @@ fn matches_plan(plan: &QueryPlan, e: &UsageEvent) -> bool {
         }
     }
     for f in &plan.filters {
-        let actual = match f.field.as_str() {
+        let actual: Option<&str> = match f.field.as_str() {
             "account_id" => Some(e.account_id.0.as_str()),
             "subscription_id" => e.subscription_id.as_ref().map(|s| s.0.as_str()),
             "product_id" => Some(e.product_id.0.as_str()),
@@ -330,6 +330,16 @@ fn matches_plan(plan: &QueryPlan, e: &UsageEvent) -> bool {
             "model_id" => e.model_id.as_ref().map(|m| m.0.as_str()),
             "source" => Some(e.source.0.as_str()),
             "unit" => Some(e.unit.0.as_str()),
+            // Filter by event kind so operators can isolate corrections /
+            // retractions from original usage events for forensics. The
+            // rollup builder doesn't include `kind` in its key (so net
+            // totals naturally include adjustments), but raw audit
+            // queries need the distinction.
+            "kind" => Some(match e.kind {
+                EventKind::Usage => "Usage",
+                EventKind::Correction => "Correction",
+                EventKind::Retraction => "Retraction",
+            }),
             other => {
                 if let Some(v) = e.dimensions.inner.get(other) {
                     Some(v.as_str())
@@ -368,6 +378,11 @@ fn group_key_value(field: &str, e: &UsageEvent) -> String {
         "unit" => e.unit.0.clone(),
         "hour_start_ms" => ((e.timestamp_ms / 3_600_000) * 3_600_000).to_string(),
         "day" => ((e.timestamp_ms / 86_400_000) * 86_400_000).to_string(),
+        "kind" => match e.kind {
+            EventKind::Usage => "Usage".to_string(),
+            EventKind::Correction => "Correction".to_string(),
+            EventKind::Retraction => "Retraction".to_string(),
+        },
         other => e
             .dimensions
             .inner

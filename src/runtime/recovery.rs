@@ -28,33 +28,18 @@ impl Recovery {
     pub fn run_startup_recovery(&self, dedupe_capacity: usize) -> IoResult<RecoveryResult> {
         info!("Starting recovery...");
 
-        // 1. Load manifest. Fail closed on corruption — a silent fallback
-        //    to Manifest::default would orphan every committed segment and
-        //    make the DB look empty, which for a billing database is a
-        //    far worse outcome than refusing to start (review P1 #2).
-        let manifest_path = self.db_root.join("manifest.json");
-        let manifest: Manifest = if manifest_path.exists() {
-            let data = fs::read_to_string(&manifest_path)?;
-            match serde_json::from_str::<Manifest>(&data) {
-                Ok(m) => {
-                    info!("Loaded manifest with {} raw segments", m.raw_segments.len());
-                    m
-                }
-                Err(e) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Corrupt manifest at {:?}: {}. Refusing to start — \
-                             back up the file and inspect manually before retrying. \
-                             Restoring from a sibling manifest.json.tmp may recover.",
-                            manifest_path, e
-                        ),
-                    ));
-                }
+        // 1. Load manifest from the generation directory. `Manifest::load`
+        //    walks backwards through generations if CURRENT points at a
+        //    corrupt file (review Phase A — manifest generations), and
+        //    auto-migrates a legacy `manifest.json` to generation 1.
+        //    Returns Ok(None) only for a truly fresh DB (no manifest at
+        //    all); Err on Corrupt manifest still aborts startup.
+        let manifest: Manifest = match Manifest::load(&self.db_root)? {
+            Some(m) => m,
+            None => {
+                info!("No manifest found, starting fresh DB");
+                Manifest::default()
             }
-        } else {
-            info!("No manifest found, starting fresh DB");
-            Manifest::default()
         };
 
         let last_sealed_wal_id = manifest.last_sealed_wal_id;
