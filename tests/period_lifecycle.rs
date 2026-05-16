@@ -161,6 +161,9 @@ fn is_period_closed_finds_match() {
         year: 2026,
         month: 5,
         closed_at_ms: 1000,
+        frozen_quantity: None,
+        frozen_event_count: None,
+        watermark_at_close_ms: None,
     });
     assert!(is_period_closed(&manifest, "acc", 2026, 5));
     assert!(!is_period_closed(&manifest, "acc", 2026, 6));
@@ -339,6 +342,298 @@ async fn closed_period_only_rejects_in_period_timestamps() {
     let resp: IngestBatchResponse = serde_json::from_value(body).unwrap();
     assert_eq!(resp.accepted, 2, "events outside closed period must be accepted");
     assert_eq!(resp.rejected, 0);
+}
+
+// =========================================================================
+// Frozen snapshot semantics
+// =========================================================================
+
+#[tokio::test]
+async fn close_captures_frozen_snapshot() {
+    let root = tmp_root();
+    let state = build_state(root.clone());
+
+    // Ingest two Usage events in 2026-05.
+    let payload = IngestBatchRequest {
+        events: vec![
+            make_event("e1", "acc_s", ts_at(2026, 5, 10), 50),
+            make_event("e2", "acc_s", ts_at(2026, 5, 20), 75),
+        ],
+    };
+    let _ = json_post(state.clone(), "/v1/usage/batch", serde_json::to_value(&payload).unwrap()).await;
+
+    // Force a flush + rollup so the rollup query at close time has
+    // committed data to read. We drive the rollup worker directly.
+    use usagedb::rollup::worker::RollupWorker;
+    let memtable_events = {
+        let mut m = state.memtable.lock().await;
+        m.drain_all()
+    };
+    // Write a segment for the events directly so the rollup worker has
+    // segments to scan.
+    use usagedb::ingest::flusher::build_segment_meta;
+    use usagedb::model::ids::bucket_for_account;
+    use usagedb::storage::segment_writer::RawSegmentWriter;
+    let bucket = bucket_for_account(&AccountId("acc_s".into()), 2);
+    let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
+    let path = state.config.db_root.join(format!("{}.seg", segment_id));
+    let mut w = RawSegmentWriter::new(path).unwrap();
+    for e in &memtable_events { w.write_event(e).unwrap(); }
+    let (_rows, checksum) = w.finish().unwrap();
+    let meta = build_segment_meta(&segment_id, &memtable_events, bucket, checksum);
+    {
+        let mut m = state.manifest.write().await;
+        m.raw_segments.push(meta);
+        m.save(&state.config.db_root).unwrap();
+    }
+    let worker = RollupWorker::new(
+        state.clone(),
+        0,
+        std::time::Duration::from_secs(30),
+        i64::MAX,
+    );
+    worker
+        .tick(ts_at(2026, 6, 1) + 60_000)
+        .await
+        .unwrap();
+
+    // Close the period — should snapshot 50 + 75 = 125 with 2 events.
+    let (status, body) =
+        empty_post(state.clone(), "/v1/accounts/acc_s/periods/2026-05/close").await;
+    assert_eq!(status, StatusCode::OK);
+    let frozen = &body["frozen"];
+    assert!(!frozen.is_null(), "close response must include frozen snapshot");
+    assert_eq!(frozen["quantity"], serde_json::json!("125"));
+    assert_eq!(frozen["event_count"], serde_json::json!(2));
+}
+
+#[tokio::test]
+async fn get_period_returns_frozen_snapshot_after_close() {
+    let root = tmp_root();
+    let state = build_state(root.clone());
+
+    // Same setup as the snapshot test.
+    let payload = IngestBatchRequest {
+        events: vec![make_event("e1", "acc_g", ts_at(2026, 5, 10), 200)],
+    };
+    let _ = json_post(state.clone(), "/v1/usage/batch", serde_json::to_value(&payload).unwrap()).await;
+
+    use usagedb::ingest::flusher::build_segment_meta;
+    use usagedb::model::ids::bucket_for_account;
+    use usagedb::rollup::worker::RollupWorker;
+    use usagedb::storage::segment_writer::RawSegmentWriter;
+    let events = state.memtable.lock().await.drain_all();
+    let bucket = bucket_for_account(&AccountId("acc_g".into()), 2);
+    let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
+    let path = state.config.db_root.join(format!("{}.seg", segment_id));
+    let mut w = RawSegmentWriter::new(path).unwrap();
+    for e in &events { w.write_event(e).unwrap(); }
+    let (_rows, checksum) = w.finish().unwrap();
+    let meta = build_segment_meta(&segment_id, &events, bucket, checksum);
+    {
+        let mut m = state.manifest.write().await;
+        m.raw_segments.push(meta);
+        m.save(&state.config.db_root).unwrap();
+    }
+    let worker = RollupWorker::new(state.clone(), 0, std::time::Duration::from_secs(30), i64::MAX);
+    worker.tick(ts_at(2026, 6, 1) + 60_000).await.unwrap();
+
+    // Close.
+    let _ = empty_post(state.clone(), "/v1/accounts/acc_g/periods/2026-05/close").await;
+
+    // GET should return the frozen snapshot, not a live total.
+    let (_status, body) = get_json(state.clone(), "/v1/accounts/acc_g/periods/2026-05").await;
+    assert_eq!(body["state"], serde_json::json!("Closed"));
+    assert_eq!(body["frozen"]["quantity"], serde_json::json!("200"));
+    assert_eq!(body["frozen"]["event_count"], serde_json::json!(1));
+    assert_eq!(
+        body["adjustments_quantity"],
+        serde_json::json!("0"),
+        "no adjustments yet"
+    );
+    assert_eq!(body["net_total"], serde_json::json!("200"));
+}
+
+#[tokio::test]
+async fn correction_after_close_surfaces_as_adjustment_not_frozen() {
+    let root = tmp_root();
+    let state = build_state(root.clone());
+
+    // Setup: 1 event of 100, rolled up, then close.
+    let payload = IngestBatchRequest {
+        events: vec![make_event("orig", "acc_c", ts_at(2026, 5, 10), 100)],
+    };
+    let _ = json_post(state.clone(), "/v1/usage/batch", serde_json::to_value(&payload).unwrap()).await;
+
+    use usagedb::ingest::flusher::build_segment_meta;
+    use usagedb::model::ids::bucket_for_account;
+    use usagedb::rollup::worker::RollupWorker;
+    use usagedb::storage::segment_writer::RawSegmentWriter;
+    let events = state.memtable.lock().await.drain_all();
+    let bucket = bucket_for_account(&AccountId("acc_c".into()), 2);
+    let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
+    let path = state.config.db_root.join(format!("{}.seg", segment_id));
+    let mut w = RawSegmentWriter::new(path).unwrap();
+    for e in &events { w.write_event(e).unwrap(); }
+    let (_rows, checksum) = w.finish().unwrap();
+    let meta = build_segment_meta(&segment_id, &events, bucket, checksum);
+    {
+        let mut m = state.manifest.write().await;
+        m.raw_segments.push(meta);
+        m.save(&state.config.db_root).unwrap();
+    }
+    let worker = RollupWorker::new(state.clone(), 0, std::time::Duration::from_secs(30), i64::MAX);
+    worker.tick(ts_at(2026, 6, 1) + 60_000).await.unwrap();
+    let _ = empty_post(state.clone(), "/v1/accounts/acc_c/periods/2026-05/close").await;
+
+    // Now land a Correction event in the closed period.
+    let mut correction = make_event("corr", "acc_c", ts_at(2026, 5, 15), -40);
+    correction.kind = EventKind::Correction;
+    correction.correction_ref = Some(CorrectionRef {
+        original_event_id: EventId("orig".into()),
+        reason: "overcount".into(),
+    });
+    let payload = IngestBatchRequest { events: vec![correction] };
+    let (_status, body) = json_post(
+        state.clone(),
+        "/v1/usage/batch",
+        serde_json::to_value(&payload).unwrap(),
+    )
+    .await;
+    let resp: IngestBatchResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(resp.accepted, 1, "correction should be accepted in closed period");
+
+    // GET should show: frozen still 100, pending_adjustments has the
+    // correction, net_total = 60.
+    let (_status, body) = get_json(state.clone(), "/v1/accounts/acc_c/periods/2026-05").await;
+    assert_eq!(
+        body["frozen"]["quantity"],
+        serde_json::json!("100"),
+        "frozen snapshot must NOT change after a post-close correction"
+    );
+    let adjustments = body["pending_adjustments"].as_array().expect("adjustments array");
+    assert_eq!(adjustments.len(), 1);
+    assert_eq!(adjustments[0]["event_id"], serde_json::json!("corr"));
+    assert_eq!(body["net_total"], serde_json::json!("60"));
+}
+
+#[tokio::test]
+async fn closing_twice_keeps_original_snapshot() {
+    let root = tmp_root();
+    let state = build_state(root.clone());
+
+    // Setup with one event + rollup.
+    let payload = IngestBatchRequest {
+        events: vec![make_event("e1", "acc_t", ts_at(2026, 5, 10), 100)],
+    };
+    let _ = json_post(state.clone(), "/v1/usage/batch", serde_json::to_value(&payload).unwrap()).await;
+
+    use usagedb::ingest::flusher::build_segment_meta;
+    use usagedb::model::ids::bucket_for_account;
+    use usagedb::rollup::worker::RollupWorker;
+    use usagedb::storage::segment_writer::RawSegmentWriter;
+    let events = state.memtable.lock().await.drain_all();
+    let bucket = bucket_for_account(&AccountId("acc_t".into()), 2);
+    let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
+    let path = state.config.db_root.join(format!("{}.seg", segment_id));
+    let mut w = RawSegmentWriter::new(path).unwrap();
+    for e in &events { w.write_event(e).unwrap(); }
+    let (_rows, checksum) = w.finish().unwrap();
+    let meta = build_segment_meta(&segment_id, &events, bucket, checksum);
+    {
+        let mut m = state.manifest.write().await;
+        m.raw_segments.push(meta);
+        m.save(&state.config.db_root).unwrap();
+    }
+    let worker = RollupWorker::new(state.clone(), 0, std::time::Duration::from_secs(30), i64::MAX);
+    worker.tick(ts_at(2026, 6, 1) + 60_000).await.unwrap();
+
+    let (_, first) = empty_post(state.clone(), "/v1/accounts/acc_t/periods/2026-05/close").await;
+    let first_closed_at = first["closed_at_ms"].as_i64().unwrap();
+    let (_, second) = empty_post(state.clone(), "/v1/accounts/acc_t/periods/2026-05/close").await;
+    assert_eq!(second["already_closed"], serde_json::json!(true));
+    assert_eq!(
+        second["closed_at_ms"].as_i64().unwrap(),
+        first_closed_at,
+        "re-close must NOT overwrite the original closed_at_ms"
+    );
+    assert_eq!(
+        second["frozen"]["quantity"],
+        serde_json::json!("100"),
+        "re-close must return the original snapshot value"
+    );
+}
+
+#[tokio::test]
+async fn reopen_then_reclose_takes_a_fresh_snapshot() {
+    let root = tmp_root();
+    let state = build_state(root.clone());
+
+    // 1 event of 100.
+    let payload = IngestBatchRequest {
+        events: vec![make_event("e1", "acc_rr", ts_at(2026, 5, 10), 100)],
+    };
+    let _ = json_post(state.clone(), "/v1/usage/batch", serde_json::to_value(&payload).unwrap()).await;
+
+    use usagedb::ingest::flusher::build_segment_meta;
+    use usagedb::model::ids::bucket_for_account;
+    use usagedb::rollup::worker::RollupWorker;
+    use usagedb::storage::segment_writer::RawSegmentWriter;
+    let events = state.memtable.lock().await.drain_all();
+    let bucket = bucket_for_account(&AccountId("acc_rr".into()), 2);
+    let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
+    let path = state.config.db_root.join(format!("{}.seg", segment_id));
+    let mut w = RawSegmentWriter::new(path).unwrap();
+    for e in &events { w.write_event(e).unwrap(); }
+    let (_rows, checksum) = w.finish().unwrap();
+    let meta = build_segment_meta(&segment_id, &events, bucket, checksum);
+    {
+        let mut m = state.manifest.write().await;
+        m.raw_segments.push(meta);
+        m.save(&state.config.db_root).unwrap();
+    }
+    let worker = RollupWorker::new(state.clone(), 0, std::time::Duration::from_secs(30), i64::MAX);
+    worker.tick(ts_at(2026, 6, 1) + 60_000).await.unwrap();
+
+    // First close: snapshot is 100.
+    let (_, first) = empty_post(state.clone(), "/v1/accounts/acc_rr/periods/2026-05/close").await;
+    assert_eq!(first["frozen"]["quantity"], serde_json::json!("100"));
+
+    // Reopen.
+    let _ = empty_post(state.clone(), "/v1/accounts/acc_rr/periods/2026-05/reopen").await;
+
+    // Ingest more.
+    let payload = IngestBatchRequest {
+        events: vec![make_event("e2", "acc_rr", ts_at(2026, 5, 20), 50)],
+    };
+    let _ = json_post(state.clone(), "/v1/usage/batch", serde_json::to_value(&payload).unwrap()).await;
+
+    // Flush + rollup again.
+    let events2 = state.memtable.lock().await.drain_all();
+    let segment_id2 = format!("raw_{}", uuid::Uuid::new_v4().simple());
+    let path2 = state.config.db_root.join(format!("{}.seg", segment_id2));
+    let mut w2 = RawSegmentWriter::new(path2).unwrap();
+    for e in &events2 { w2.write_event(e).unwrap(); }
+    let (_rows, checksum2) = w2.finish().unwrap();
+    let meta2 = build_segment_meta(&segment_id2, &events2, bucket, checksum2);
+    {
+        let mut m = state.manifest.write().await;
+        m.raw_segments.push(meta2);
+        // Force the rollup worker to redo hour 10 by rebuilding rollups.
+        m.rollup_segments.retain(|s| s.bucket != bucket || s.min_timestamp_ms != ts_at(2026, 5, 10) / 3_600_000 * 3_600_000);
+        m.watermarks.hourly_rollup_ms = 0;
+        m.save(&state.config.db_root).unwrap();
+    }
+    let worker2 = RollupWorker::new(state.clone(), 0, std::time::Duration::from_secs(30), i64::MAX);
+    worker2.tick(ts_at(2026, 6, 1) + 60_000).await.unwrap();
+
+    // Close again — snapshot should now be 150.
+    let (_, second) = empty_post(state.clone(), "/v1/accounts/acc_rr/periods/2026-05/close").await;
+    assert_eq!(
+        second["frozen"]["quantity"],
+        serde_json::json!("150"),
+        "reopen + reclose should capture a fresh snapshot"
+    );
 }
 
 #[tokio::test]

@@ -61,6 +61,18 @@ pub struct Watermarks {
 /// `Retraction` events are still accepted (they become post-close
 /// adjustments, per spec §13). An operator-driven `reopen_period`
 /// removes the entry from `closed_periods`.
+///
+/// **Frozen snapshot.** At close time the rollup totals are captured
+/// (`frozen_quantity`, `frozen_event_count`) along with the rollup
+/// watermark (`watermark_at_close_ms`). Future queries on a closed
+/// period return these values, NOT live data — that's the point of
+/// "closing" a period for invoicing. Post-close adjustments are
+/// queried separately as `pending_adjustments` (Correction +
+/// Retraction events whose timestamp lands in the closed period).
+///
+/// The frozen fields are `Option` for backward compat: a `ClosedPeriod`
+/// written by an older build has no snapshot, and queries fall back to
+/// the live total with a warning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClosedPeriod {
     pub account_id: String,
@@ -69,6 +81,16 @@ pub struct ClosedPeriod {
     /// Wall-clock when the close happened (unix ms). Surfaced in the
     /// GET endpoint so operators can correlate with their billing run.
     pub closed_at_ms: i64,
+    /// Frozen SUM(quantity) for the period at close time.
+    #[serde(default)]
+    pub frozen_quantity: Option<i128>,
+    /// Frozen event count for the period at close time.
+    #[serde(default)]
+    pub frozen_event_count: Option<u64>,
+    /// Rollup watermark at close time. Lets operators reconcile with
+    /// the state the rollup system saw.
+    #[serde(default)]
+    pub watermark_at_close_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
