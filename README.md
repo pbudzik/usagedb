@@ -57,6 +57,8 @@ Spec-aligned routes (§9.1, §12.2, §12.3):
 POST /v1/usage/batch                            { "events": [UsageEvent, ...] }
 GET  /v1/accounts/{account_id}/usage            ?from&to&group_by&product_id&meter_id&model_id&source
 GET  /v1/accounts/{account_id}/usage/events     ?from&to&meter_id&product_id
+GET  /v1/accounts/{account_id}/explain          ?from&to       — breakdown + segment provenance + corrections
+GET  /v1/accounts/{account_id}/verify           ?from&to       — raw-vs-rollup drift check
 POST /v1/query/json                             { "source", "account_id", "from", "to", "group_by", "filters", "metrics" }
 POST /v1/query/sql                              { "query": "SELECT meter_id, SUM(quantity) FROM usage_events WHERE account_id = '...' GROUP BY meter_id" }
 GET  /health
