@@ -3,6 +3,7 @@ use usagedb::runtime::state::{AppStateInner, AppState};
 use usagedb::ingest::wal::Wal;
 use usagedb::ingest::flusher::FlusherWorker;
 use usagedb::rollup::worker::RollupWorker;
+use usagedb::compact::worker::CompactionWorker;
 use usagedb::api::http_server::start_server;
 use usagedb::runtime::recovery::Recovery;
 
@@ -45,6 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rollup_tick_interval = Duration::from_secs(config.rollup_tick_interval_secs);
     let rollup_safety_lag_ms = config.rollup_safety_lag_ms;
+    let compaction_tick_interval = Duration::from_secs(config.compaction_tick_interval_secs);
+    let compaction_grace_ms = config.compaction_grace_ms;
+    let compaction_max_small = config.compaction_max_small_segments;
 
     let state: AppState = Arc::new(AppStateInner {
         config,
@@ -65,13 +69,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rollup_worker.run(rollup_shutdown_signal).await;
     });
 
+    let compaction_shutdown = Arc::new(Notify::new());
+    let compaction_shutdown_signal = compaction_shutdown.clone();
+    let compaction_worker = CompactionWorker::new(
+        state.clone(),
+        compaction_max_small,
+        compaction_grace_ms,
+        compaction_tick_interval,
+    );
+    let compaction_handle = tokio::spawn(async move {
+        compaction_worker.run(compaction_shutdown_signal).await;
+    });
+
     start_server(state.clone()).await?;
 
     info!("Waiting for background tasks to finish...");
     rollup_shutdown.notify_waiters();
+    compaction_shutdown.notify_waiters();
     drop(state);
     let _ = flusher_handle.await;
     let _ = rollup_handle.await;
+    let _ = compaction_handle.await;
 
     info!("Server gracefully shut down.");
     Ok(())

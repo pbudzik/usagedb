@@ -22,6 +22,16 @@ pub struct Config {
     /// hour to land in raw segments first. Spec §11.3 covers the open-period
     /// query handling; this lag is the bound on "open period" duration.
     pub rollup_safety_lag_ms: i64,
+    /// How often the background compaction worker checks for opportunities.
+    pub compaction_tick_interval_secs: u64,
+    /// Reader grace period (in milliseconds) before old segment files are
+    /// physically deleted after a compaction commit. Must exceed the
+    /// longest expected query duration to avoid races with snapshotted
+    /// manifest reads. Spec §15.3.
+    pub compaction_grace_ms: i64,
+    /// Trigger compaction when a bucket has more than this many small
+    /// segments. Spec §15.2 suggests 16.
+    pub compaction_max_small_segments: usize,
 }
 
 impl Default for Config {
@@ -34,6 +44,9 @@ impl Default for Config {
             default_bucket_count: 64,
             rollup_tick_interval_secs: 30,
             rollup_safety_lag_ms: 60_000, // 1 minute
+            compaction_tick_interval_secs: 60,
+            compaction_grace_ms: 30_000, // 30 seconds; covers worst-case query duration
+            compaction_max_small_segments: 16,
         }
     }
 }

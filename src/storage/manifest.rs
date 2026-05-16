@@ -29,6 +29,12 @@ pub struct SegmentMeta {
 pub struct ReplacementRecord {
     pub old_segments: Vec<String>,
     pub new_segments: Vec<String>,
+    /// When the compaction commit happened (unix ms). Used to enforce a
+    /// reader grace period before old files are physically deleted —
+    /// queries that snapshotted the manifest before the commit may still
+    /// be holding old segment IDs in memory.
+    #[serde(default)]
+    pub committed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

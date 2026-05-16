@@ -90,9 +90,9 @@ What works end-to-end:
 - Background memtable flush → immutable columnar raw segments, partitioned by `bucket = blake3(account_id) % bucket_count`
 - Columnar on-disk format with per-column zstd compression and blake3 checksum (see [Segment format](#segment-format))
 - Background hourly rollup scheduler — seals completed hours into per-bucket rollup segments, advances the manifest watermark atomically, query path routes `RollupHourly` through rollups with raw fallback for the open-period tail
+- Background compaction scheduler — merges small per-bucket segments into a single output, applies the `ReplacementRecord` to the manifest, deletes old files after a configurable reader grace period (spec §15.3)
 - Query executor: raw segments + memtable, filters, group-by, Sum/Count
 - SQL subset parser (`SELECT … FROM usage_events|usage_rollup_hourly WHERE … GROUP BY …`)
-- Compaction worker (read / sort / cold-dedupe / write) — implemented, not yet scheduled
 
 Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 
@@ -100,7 +100,6 @@ Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 - No block-level metadata for fine-grained skipping inside a segment; pruning is segment-level only.
 - Rollup segments still use length-prefixed bincode (not the columnar format) — they're tiny so it hasn't been a win yet
 - COUNT semantics differ for `RollupHourly` queries: each rollup row counts as 1, not as the number of underlying events. Use `RawEvents` source for exact event counts.
-- Compaction worker has no scheduler
 - Validation is permissive — `rejected` in the ingest response is always 0
 - No configurable durability mode — strict per-batch fsync only
 
