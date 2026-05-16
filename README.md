@@ -73,10 +73,26 @@ Ingest response counts `accepted`, `duplicates` (same id + same payload), `confl
 ```bash
 cargo build
 cargo test
-cargo run     # HTTP server on 127.0.0.1:8080
+cargo run                   # HTTP server on 127.0.0.1:8080 (default)
+cargo run -- --help         # see admin subcommands
 ```
 
-Configuration is currently hardcoded in `Config::default()` (db_root `./data`, 64 MiB memtable, 1M dedupe entries).
+Configuration is currently hardcoded in `Config::default()` (db_root `./data`, 64 MiB memtable, 1M dedupe entries). The `--db-root` flag overrides the data directory.
+
+## Admin CLI
+
+The `usagedb` binary doubles as an admin tool. Subcommands operate on the on-disk state without needing the HTTP server running:
+
+```
+usagedb serve                                                 # HTTP server (default)
+usagedb check [--deep]                                        # manifest summary; --deep verifies every segment
+usagedb rebuild-rollups --from <RFC3339> --to <RFC3339>      # drop rollups + rewind watermark
+usagedb inspect-segment <segment_id>                          # metadata + sample rows
+usagedb verify-period --account <id> --from <RFC3339> --to <RFC3339>   # raw vs rollup drift
+usagedb export-parquet <output.parquet>                       # dump every raw segment to Parquet
+```
+
+All commands accept `--db-root <path>` (default `./data`). Admin commands assume the server is **not** running concurrently — file locking to prevent that is on the backlog.
 
 ## Durability contract
 

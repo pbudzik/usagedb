@@ -1,26 +1,120 @@
-use usagedb::runtime::config::Config;
-use usagedb::runtime::state::{AppStateInner, AppState};
-use usagedb::ingest::wal::Wal;
-use usagedb::ingest::flusher::FlusherWorker;
-use usagedb::rollup::worker::RollupWorker;
-use usagedb::compact::worker::CompactionWorker;
-use usagedb::api::http_server::start_server;
-use usagedb::runtime::recovery::Recovery;
-
-use tokio::sync::{RwLock, Mutex, Notify, mpsc};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, error};
+
+use clap::{Parser, Subcommand};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+use tracing::{error, info};
+
+use usagedb::admin::{
+    cmd_check, cmd_export_parquet, cmd_inspect_segment, cmd_rebuild_rollups, cmd_verify_period,
+    open_state_for_admin,
+};
+use usagedb::api::http_server::start_server;
+use usagedb::compact::worker::CompactionWorker;
+use usagedb::ingest::flusher::FlusherWorker;
+use usagedb::ingest::wal::Wal;
+use usagedb::rollup::worker::RollupWorker;
+use usagedb::runtime::config::Config;
+use usagedb::runtime::recovery::Recovery;
+use usagedb::runtime::state::{AppState, AppStateInner};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "usagedb",
+    about = "Embedded append-only usage database for AI billing",
+    version
+)]
+struct Cli {
+    /// Database root directory.
+    #[arg(long, global = true, default_value = "./data")]
+    db_root: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the HTTP server (default if no subcommand is given).
+    Serve,
+    /// Print manifest summary. With `--deep`, also open every segment and
+    /// verify checksums + structure.
+    Check {
+        #[arg(long, default_value_t = false)]
+        deep: bool,
+    },
+    /// Drop rollup segments overlapping `[from, to)` and rewind the watermark
+    /// to `from`. The next server tick refills the gap from raw segments.
+    RebuildRollups {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
+    /// Read a specific segment and print its metadata + sample rows.
+    InspectSegment {
+        segment_id: String,
+    },
+    /// Compute raw vs rollup totals + drift for an account over a period.
+    VerifyPeriod {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
+    /// Export every raw segment to a single Parquet file.
+    ExportParquet {
+        output: PathBuf,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    info!("Starting usageDb server...");
 
-    let config = Config::default();
+    let cli = Cli::parse();
+    let mut config = Config::default();
+    config.db_root = cli.db_root;
+
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve => run_server(config).await?,
+        Command::Check { deep } => {
+            let state = open_state_for_admin(config)?;
+            let output = cmd_check(state, deep).await?;
+            print!("{}", output);
+        }
+        Command::RebuildRollups { from, to } => {
+            let state = open_state_for_admin(config)?;
+            let output = cmd_rebuild_rollups(state, &from, &to).await?;
+            print!("{}", output);
+        }
+        Command::InspectSegment { segment_id } => {
+            let state = open_state_for_admin(config)?;
+            let output = cmd_inspect_segment(state, &segment_id).await?;
+            print!("{}", output);
+        }
+        Command::VerifyPeriod { account, from, to } => {
+            let state = open_state_for_admin(config)?;
+            let output = cmd_verify_period(state, &account, &from, &to).await?;
+            print!("{}", output);
+        }
+        Command::ExportParquet { output } => {
+            let state = open_state_for_admin(config)?;
+            let output_msg = cmd_export_parquet(state, &output).await?;
+            print!("{}", output_msg);
+        }
+    }
+    Ok(())
+}
+
+async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting usageDb server...");
     std::fs::create_dir_all(&config.db_root)?;
 
-    // Run startup recovery: load manifest, clean tmp, replay WAL
+    // Run startup recovery: load manifest, clean tmp, replay WAL.
     let recovery = Recovery::new(config.db_root.clone());
     let mut recovery_result = match recovery.run_startup_recovery(config.dedupe_capacity) {
         Ok(r) => r,
@@ -89,7 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     start_server(state.clone()).await?;
 
-    // Shutdown flush (review P1 #6): drain the memtable + rotate the WAL
+    // Shutdown drain (review P1 #6): drain the memtable + rotate the WAL
     // so any events accumulated since the last size-based flush become
     // durable raw segments instead of staying stranded in WAL files.
     {
