@@ -106,9 +106,23 @@ What works end-to-end:
 - Query executor: raw segments + memtable, filters, group-by, Sum/Count; pruning uses `bucket(account_id)`, `min_account_id`/`max_account_id`, and per-segment `product_ids`/`meter_ids`/`model_ids` from `SegmentMeta` before opening segment files
 - Half-open `[from, to)` time-range semantics across all query paths so adjacent month queries don't double-count boundary events
 - SQL subset parser is strict — `SUM` accepts only `quantity`, `COUNT` accepts only `*`, ranges distinguish `<`/`<=` and `>`/`>=`, `OR`/`HAVING`/aliases/`SELECT *` are rejected explicitly rather than silently mapped
-- Fail-closed recovery on corrupt manifest (refuses to start instead of silently falling back to an empty manifest)
+- Manifest generations under `manifest/` (`CURRENT` + `manifest-NNNNNN.json`) with auto-migration from a legacy single-file `manifest.json`. Recovery rolls back to the previous valid generation if the current one is corrupt; falls fully closed only if no generation parses. The last 10 generations are retained.
+- Operator-facing `RollupWorker::rebuild_rollups(from_ms, to_ms)` — drops rollup segments overlapping the range, rewinds the watermark to `from_ms`, lets the next tick refill the gap from raw events. Used when a rollup bug is fixed, late data arrives for a sealed hour, or to verify rollup-vs-raw drift.
+- Correction / Retraction events work end-to-end: validation requires `correction_ref`, the rollup builder treats negative-quantity corrections as net adjustments (so SUM = original + correction), and queries can filter or group by `kind` to isolate adjustments for forensics.
 - Shutdown drain — `ctrl+c` flushes the memtable before exiting
 - proptest property tests for spec §19 invariants (`tests/properties.rs`): raw=rollup totals, dedupe idempotence under retry, compaction-preserves-sum, recovery-preserves-sum (with and without prior flush), rollup-tick idempotence, payload-conflict detection — 32 randomized cases per property, regenerated on every CI run
+
+Manifest layout (Phase A — generations):
+
+```
+db_root/
+  manifest/
+    CURRENT                          (single line: latest valid generation u64)
+    manifest-000001.json
+    manifest-000002.json             (last KEEP_GENERATIONS = 10 retained)
+    ...
+  manifest.json                       (legacy; auto-migrated to generation 1 on first load)
+```
 
 Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 

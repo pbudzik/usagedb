@@ -267,6 +267,41 @@ impl RollupWorker {
         })
     }
 
+    /// Operator-facing: drop any rollup segments overlapping `[from_ms, to_ms)`
+    /// and rewind the watermark to `from_ms`. The next tick refills the
+    /// gap from raw segments (review Phase A — rebuildable rollups).
+    ///
+    /// Use cases:
+    ///   - a bug in the rollup builder was fixed and the cached rollups
+    ///     need to be regenerated
+    ///   - late events arrived for a period that was already sealed and
+    ///     the rollups undercounted
+    ///   - operator just wants to verify rollup = raw after the next tick
+    ///
+    /// The rollup segment *files* are not deleted immediately — they're
+    /// just removed from `manifest.rollup_segments`, so any in-flight
+    /// query that snapshotted the manifest can still open them. Cleanup
+    /// of orphaned rollup files is a future operability task.
+    pub async fn rebuild_rollups(&self, from_ms: i64, to_ms: i64) -> anyhow::Result<usize> {
+        let mut manifest = self.state.manifest.write().await;
+        let before = manifest.rollup_segments.len();
+        manifest.rollup_segments.retain(|s| {
+            // Keep segments that don't overlap [from_ms, to_ms).
+            !(s.min_timestamp_ms < to_ms && s.max_timestamp_ms >= from_ms)
+        });
+        let dropped = before - manifest.rollup_segments.len();
+
+        if manifest.watermarks.hourly_rollup_ms > from_ms {
+            manifest.watermarks.hourly_rollup_ms = from_ms;
+        }
+        manifest.save(&self.state.config.db_root)?;
+        info!(
+            "Rebuild scheduled: dropped {} rollup segment(s) in [{}, {}); watermark rewound to {}",
+            dropped, from_ms, to_ms, manifest.watermarks.hourly_rollup_ms
+        );
+        Ok(dropped)
+    }
+
     /// Drain the memtable, rotate the WAL, and queue the resulting batch
     /// for the flusher. Same primitives the ingest path uses when the
     /// size threshold trips. Called from `tick` when the memtable has
