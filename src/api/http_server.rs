@@ -47,6 +47,10 @@ pub fn build_router(state: AppState) -> Router {
         // Phase D operability — explain a total and verify rollup-vs-raw drift.
         .route("/v1/accounts/{account_id}/explain", get(handle_explain))
         .route("/v1/accounts/{account_id}/verify", get(handle_verify))
+        // Period lifecycle (minimal: Open ↔ Closed).
+        .route("/v1/accounts/{account_id}/periods/{period}", get(handle_get_period))
+        .route("/v1/accounts/{account_id}/periods/{period}/close", post(handle_close_period))
+        .route("/v1/accounts/{account_id}/periods/{period}/reopen", post(handle_reopen_period))
         // Flexible POST query for arbitrary filter shapes.
         .route("/v1/query/json", post(handle_query_json))
         // SQL subset endpoint.
@@ -140,6 +144,17 @@ async fn handle_ingest(
     // wonky clock can't poison TTL eviction). Rejected events never
     // reach the WAL or dedupe.
     let ingest_now = now_ms();
+
+    // Snapshot the closed-periods list under the manifest read lock so
+    // the per-event check below is cheap (no async lock in the loop).
+    // The window between snapshot and validation is small enough that a
+    // racing close_period call doesn't matter — the operator should
+    // wait for expected ingest to drain before closing anyway.
+    let closed_snapshot: Vec<crate::storage::manifest::ClosedPeriod> = {
+        let manifest = state.manifest.read().await;
+        manifest.closed_periods.clone()
+    };
+
     let mut rejected = 0usize;
     let mut classified: Vec<Classified> = Vec::with_capacity(payload.events.len());
     for mut event in payload.events {
@@ -147,6 +162,28 @@ async fn handle_ingest(
             rejected += 1;
             tracing::warn!(?reason, event_id = %event.event_id.0, "rejected event");
             continue;
+        }
+        // Period-closed check: reject `Usage` events landing in a
+        // closed period. Corrections / retractions are intentionally
+        // allowed through — they become post-close adjustments.
+        if matches!(event.kind, EventKind::Usage) {
+            if let Some((year, month)) = crate::period::period_for_ts(event.timestamp_ms) {
+                if closed_snapshot
+                    .iter()
+                    .any(|p| p.account_id == event.account_id.0
+                        && p.year == year
+                        && p.month == month)
+                {
+                    rejected += 1;
+                    tracing::warn!(
+                        event_id = %event.event_id.0,
+                        account = %event.account_id.0,
+                        year, month,
+                        "rejected: Usage event in closed period"
+                    );
+                    continue;
+                }
+            }
         }
         event.ingested_at_ms = ingest_now;
         let (event_id_hash, payload_hash) = compute_event_hashes(&event);
@@ -654,6 +691,151 @@ async fn handle_verify(
         "rollup_total": rollup_total.to_string(),
         "drift": drift.to_string(),
         "matches": drift == 0,
+    })))
+}
+
+/// `POST /v1/accounts/{account_id}/periods/{YYYY-MM}/close`
+///
+/// Marks the (account, year, month) period as closed. Subsequent `Usage`
+/// events with a timestamp inside this period will be rejected at
+/// ingest. `Correction` and `Retraction` events for closed periods are
+/// still accepted — they become adjustments.
+async fn handle_close_period(
+    State(state): State<AppState>,
+    Path((account_id, period)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::period::parse_period;
+    use crate::storage::manifest::ClosedPeriod;
+
+    let (year, month) = parse_period(&period)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid period: {}", e)))?;
+
+    let mut manifest = state.manifest.write().await;
+    if manifest.closed_periods.iter().any(|p| {
+        p.account_id == account_id && p.year == year && p.month == month
+    }) {
+        return Ok(Json(serde_json::json!({
+            "account_id": account_id,
+            "period": period,
+            "state": "Closed",
+            "already_closed": true,
+        })));
+    }
+    let closed_at_ms = now_ms();
+    manifest.closed_periods.push(ClosedPeriod {
+        account_id: account_id.clone(),
+        year,
+        month,
+        closed_at_ms,
+    });
+    manifest
+        .save(&state.config.db_root)
+        .map_err(|e| AppError(anyhow::anyhow!("manifest save: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "account_id": account_id,
+        "period": period,
+        "state": "Closed",
+        "closed_at_ms": closed_at_ms,
+    })))
+}
+
+/// `POST /v1/accounts/{account_id}/periods/{YYYY-MM}/reopen`
+///
+/// Removes the closed marker. Future `Usage` events for the period are
+/// accepted again.
+async fn handle_reopen_period(
+    State(state): State<AppState>,
+    Path((account_id, period)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::period::parse_period;
+
+    let (year, month) = parse_period(&period)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid period: {}", e)))?;
+
+    let mut manifest = state.manifest.write().await;
+    let before = manifest.closed_periods.len();
+    manifest.closed_periods.retain(|p| {
+        !(p.account_id == account_id && p.year == year && p.month == month)
+    });
+    let removed = before - manifest.closed_periods.len();
+    if removed > 0 {
+        manifest
+            .save(&state.config.db_root)
+            .map_err(|e| AppError(anyhow::anyhow!("manifest save: {}", e)))?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "account_id": account_id,
+        "period": period,
+        "state": "Open",
+        "removed": removed > 0,
+    })))
+}
+
+/// `GET /v1/accounts/{account_id}/periods/{YYYY-MM}`
+///
+/// Returns the period's current state (`Open`/`Closed`), `closed_at_ms`
+/// if applicable, and the current SUM(quantity) over the period. The
+/// SUM is live (not a frozen snapshot) — future snapshot semantics
+/// will land alongside intermediate states (Closing/Invoiced/Adjusted).
+async fn handle_get_period(
+    State(state): State<AppState>,
+    Path((account_id, period)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::period::{find_closed, parse_period};
+    use crate::query::executor::execute_plan;
+    use crate::query::plan::{AggregationFunction, QueryPlan, QuerySource};
+
+    let (year, month) = parse_period(&period)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid period: {}", e)))?;
+
+    // Period bounds: [first day of month UTC, first day of next month UTC).
+    use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+    let from_dt = NaiveDate::from_ymd_opt(year as i32, month as u32, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .ok_or_else(|| AppError(anyhow::anyhow!("invalid date for period {}", period)))?;
+    let next_month_dt: NaiveDateTime = if month == 12 {
+        NaiveDate::from_ymd_opt(year as i32 + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year as i32, month as u32 + 1, 1)
+    }
+    .and_then(|d| d.and_hms_opt(0, 0, 0))
+    .ok_or_else(|| AppError(anyhow::anyhow!("invalid date for period {}", period)))?;
+    let from_ms = Utc.from_utc_datetime(&from_dt).timestamp_millis();
+    let to_ms = Utc.from_utc_datetime(&next_month_dt).timestamp_millis();
+
+    let mut metrics = HashMap::new();
+    metrics.insert("quantity".to_string(), AggregationFunction::Sum);
+    let plan = QueryPlan {
+        source: QuerySource::RollupHourly,
+        account_id: Some(account_id.clone()),
+        from_ms,
+        to_ms,
+        filters: vec![],
+        group_by: vec![],
+        metrics,
+        limit: None,
+    };
+    let result = execute_plan(&state, &plan).await;
+    let total = extract_quantity_sum(&result);
+
+    let (manifest_state, closed_at_ms) = {
+        let manifest = state.manifest.read().await;
+        match find_closed(&manifest, &account_id, year, month) {
+            Some(p) => ("Closed", Some(p.closed_at_ms)),
+            None => ("Open", None),
+        }
+    };
+
+    Ok(Json(serde_json::json!({
+        "account_id": account_id,
+        "period": period,
+        "state": manifest_state,
+        "closed_at_ms": closed_at_ms,
+        "from_ms": from_ms,
+        "to_ms": to_ms,
+        "total_quantity": total.to_string(),
     })))
 }
 

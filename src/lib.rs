@@ -4,6 +4,7 @@ pub mod compact;
 pub mod export;
 pub mod ingest;
 pub mod model;
+pub mod period;
 pub mod query;
 pub mod rollup;
 pub mod runtime;

@@ -59,6 +59,9 @@ GET  /v1/accounts/{account_id}/usage            ?from&to&group_by&product_id&met
 GET  /v1/accounts/{account_id}/usage/events     ?from&to&meter_id&product_id
 GET  /v1/accounts/{account_id}/explain          ?from&to       — breakdown + segment provenance + corrections
 GET  /v1/accounts/{account_id}/verify           ?from&to       — raw-vs-rollup drift check
+GET  /v1/accounts/{account_id}/periods/{YYYY-MM}                       — state + total
+POST /v1/accounts/{account_id}/periods/{YYYY-MM}/close                 — mark closed
+POST /v1/accounts/{account_id}/periods/{YYYY-MM}/reopen                — mark open
 POST /v1/query/json                             { "source", "account_id", "from", "to", "group_by", "filters", "metrics" }
 POST /v1/query/sql                              { "query": "SELECT meter_id, SUM(quantity) FROM usage_events WHERE account_id = '...' GROUP BY meter_id" }
 GET  /health
@@ -66,7 +69,7 @@ GET  /health
 
 `from` / `to` are RFC 3339. Supported `metrics`: `sum`, `count`. Supported group keys: column names (`account_id`, `product_id`, `meter_id`, `model_id`, `source`, `unit`), `hour_start_ms`, `day`, or any dimension key. The account-usage GET defaults `source=rollup` for fast monthly totals; pass `source=raw` to force a raw scan.
 
-Ingest response counts `accepted`, `duplicates` (same id + same payload), `conflicts` (same id + different payload — surfaces silent collector bugs), and `rejected` (validation failures: missing required IDs, non-positive timestamp, >16 dimensions, Correction/Retraction without `correction_ref`).
+Ingest response counts `accepted`, `duplicates` (same id + same payload), `conflicts` (same id + different payload — surfaces silent collector bugs), and `rejected` (validation failures: missing required IDs, non-positive timestamp, >16 dimensions, Correction/Retraction without `correction_ref`, or `Usage` event landing in a closed period).
 
 ## Building and running
 

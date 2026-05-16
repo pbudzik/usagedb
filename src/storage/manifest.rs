@@ -56,6 +56,21 @@ pub struct Watermarks {
     pub hourly_rollup_ms: i64,
 }
 
+/// A finalized billing period for one account. New `Usage` events with a
+/// timestamp inside this period are rejected at ingest. `Correction` and
+/// `Retraction` events are still accepted (they become post-close
+/// adjustments, per spec §13). An operator-driven `reopen_period`
+/// removes the entry from `closed_periods`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClosedPeriod {
+    pub account_id: String,
+    pub year: u16,
+    pub month: u8,
+    /// Wall-clock when the close happened (unix ms). Surfaced in the
+    /// GET endpoint so operators can correlate with their billing run.
+    pub closed_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Manifest {
     pub db_version: u32,
@@ -69,6 +84,13 @@ pub struct Manifest {
     /// replayed on recovery.
     #[serde(default)]
     pub last_sealed_wal_id: u64,
+
+    /// Per-account billing periods that have been closed. `Usage` events
+    /// timestamped inside any of these are rejected at ingest.
+    /// `#[serde(default)]` so manifests written before period lifecycle
+    /// deserialize with an empty list.
+    #[serde(default)]
+    pub closed_periods: Vec<ClosedPeriod>,
 
     /// Generation number — bumps on every save. Used by the manifest-
     /// generation recovery to walk backwards through historical versions
