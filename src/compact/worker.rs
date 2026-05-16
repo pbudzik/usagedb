@@ -24,6 +24,7 @@ impl CompactionWorker {
         &self,
         db_root: &Path,
         input_segment_ids: &[String],
+        bucket: u32,
     ) -> IoResult<(SegmentMeta, ReplacementRecord)> {
         let mut events: Vec<UsageEvent> = Vec::new();
         for id in input_segment_ids {
@@ -81,7 +82,7 @@ impl CompactionWorker {
             deduped.len()
         );
 
-        let meta = build_segment_meta(&output_id, &deduped);
+        let meta = build_segment_meta(&output_id, &deduped, bucket);
         Ok((
             meta,
             ReplacementRecord {

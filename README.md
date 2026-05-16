@@ -84,10 +84,10 @@ If step 2 fails, no dedupe state is mutated — client retries do not see false 
 
 What works end-to-end:
 
-- Durable batch ingest with idempotent dedupe (hot cache, 7-day TTL)
+- Durable batch ingest with idempotent dedupe (blake3 128-bit hash, 7-day TTL)
 - WAL rotation, sealing, and crash recovery (memtable rebuilt from unsealed files)
 - Atomic manifest updates (tmp + rename + parent dir fsync)
-- Background memtable flush → immutable raw segments
+- Background memtable flush → immutable raw segments, partitioned by `bucket = blake3(account_id) % bucket_count`
 - Query executor: raw segments + memtable, filters, group-by, Sum/Count
 - SQL subset parser (`SELECT … FROM usage_events|usage_rollup_hourly WHERE … GROUP BY …`)
 - Compaction worker (read / sort / cold-dedupe / write) — implemented, not yet scheduled
@@ -95,10 +95,8 @@ What works end-to-end:
 Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 
 - Segments are length-prefixed `bincode` rows, not the spec's columnar format with block metadata, compression, and checksums (the encoding/compression helpers exist but aren't wired into the writer)
-- Bucket assignment is hardcoded to 0 (no `hash(account_id) % bucket_count` yet)
 - Hourly rollup builder exists but has no background scheduler — rollup queries fall back to scanning raw events
 - Compaction worker has no scheduler
-- Event-id dedupe uses a 64-bit `DefaultHasher`; spec calls for a stable ≥128-bit hash (blake3 / xxhash3)
 - Validation is permissive — `rejected` in the ingest response is always 0
 - No configurable durability mode — strict per-batch fsync only
 

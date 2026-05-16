@@ -2,11 +2,12 @@ use crate::runtime::state::{AppState, FlushMessage};
 use tokio::sync::mpsc;
 use tracing::{info, error};
 use crate::model::event::UsageEvent;
+use crate::model::ids::{AccountId, bucket_for_account};
 use crate::storage::segment_writer::RawSegmentWriter;
 use crate::storage::manifest::{SegmentMeta, SegmentKind};
 use crate::ingest::wal::Wal;
-use crate::model::ids::AccountId;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 
 pub struct FlusherWorker {
     state: AppState,
@@ -28,62 +29,110 @@ impl FlusherWorker {
 
     async fn handle_message(&self, msg: FlushMessage) {
         let FlushMessage { events, sealed_wal_id } = msg;
-        info!("Flushing {} events to raw segment (sealed wal_id={})", events.len(), sealed_wal_id);
-
-        let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
-        let path = self.state.config.db_root.join(format!("{}.seg", segment_id));
-
-        // Write the segment file. On any write error, abort: do NOT update
-        // the manifest and do NOT delete WAL files. Recovery will replay.
-        let mut writer = match RawSegmentWriter::new(path.clone()) {
-            Ok(w) => w,
-            Err(e) => {
-                error!("Failed to create segment writer: {}", e);
-                return;
-            }
-        };
-        for event in &events {
-            if let Err(e) = writer.write_event(event) {
-                error!("Failed to write event to segment {}: {} — aborting flush", segment_id, e);
-                let _ = std::fs::remove_file(&path);
-                return;
-            }
-        }
-        if let Err(e) = writer.finish() {
-            error!("Failed to finish raw segment {}: {} — aborting flush", segment_id, e);
-            let _ = std::fs::remove_file(&path);
+        if events.is_empty() {
             return;
         }
 
-        let meta = build_segment_meta(&segment_id, &events);
+        // Partition events by bucket so each segment covers a single
+        // (date_partition_implicit_via_ts, bucket). Mixed-account batches
+        // are split into one segment per bucket they touch.
+        let bucket_count = {
+            let manifest = self.state.manifest.read().await;
+            manifest.bucket_count.max(1)
+        };
+        let mut by_bucket: BTreeMap<u32, Vec<UsageEvent>> = BTreeMap::new();
+        for event in events {
+            let bucket = bucket_for_account(&event.account_id, bucket_count);
+            by_bucket.entry(bucket).or_default().push(event);
+        }
+        info!(
+            "Flushing {} bucket(s) to disk (sealed wal_id={})",
+            by_bucket.len(), sealed_wal_id
+        );
 
-        // Atomically update the manifest: append segment, advance the WAL
-        // seal pointer, then save. Save() does the rename+fsync dance.
+        // Write each bucket's segment + collect metas. We update the
+        // manifest once at the end so the sealed-wal pointer advances
+        // atomically with all segments from this drain.
+        let mut new_metas: Vec<SegmentMeta> = Vec::with_capacity(by_bucket.len());
+        let mut written_paths: Vec<PathBuf> = Vec::with_capacity(by_bucket.len());
+
+        for (bucket, bucket_events) in by_bucket {
+            let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
+            let path = self.state.config.db_root.join(format!("{}.seg", segment_id));
+
+            let mut writer = match RawSegmentWriter::new(path.clone()) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to create segment writer for bucket {}: {}", bucket, e);
+                    rollback_partial(&written_paths);
+                    return;
+                }
+            };
+            let mut write_failed = false;
+            for event in &bucket_events {
+                if let Err(e) = writer.write_event(event) {
+                    error!("Failed to write event to bucket {} segment {}: {}", bucket, segment_id, e);
+                    write_failed = true;
+                    break;
+                }
+            }
+            if write_failed {
+                let _ = std::fs::remove_file(&path);
+                rollback_partial(&written_paths);
+                return;
+            }
+            if let Err(e) = writer.finish() {
+                error!("Failed to finish bucket {} segment {}: {}", bucket, segment_id, e);
+                let _ = std::fs::remove_file(&path);
+                rollback_partial(&written_paths);
+                return;
+            }
+
+            new_metas.push(build_segment_meta(&segment_id, &bucket_events, bucket));
+            written_paths.push(path);
+        }
+
+        // All bucket segments are durable on disk. Commit the manifest
+        // atomically with the WAL seal pointer.
         {
             let mut manifest = self.state.manifest.write().await;
-            manifest.raw_segments.push(meta);
+            for meta in &new_metas {
+                manifest.raw_segments.push(meta.clone());
+            }
             if sealed_wal_id > manifest.last_sealed_wal_id {
                 manifest.last_sealed_wal_id = sealed_wal_id;
             }
             if let Err(e) = manifest.save(&self.state.config.db_root) {
-                error!("Failed to save manifest after flush: {} — segment is on disk, WAL kept", e);
+                error!(
+                    "Failed to save manifest after flush: {} — segments are on disk but unreferenced; will be cleaned up by recovery",
+                    e
+                );
                 return;
             }
         }
 
-        info!("Successfully flushed segment {}", segment_id);
+        info!(
+            "Flush committed: {} segments ({}), wal sealed through {}",
+            new_metas.len(),
+            new_metas.iter().map(|m| m.segment_id.as_str()).collect::<Vec<_>>().join(", "),
+            sealed_wal_id
+        );
 
-        // Now that the manifest is durable, sealed WAL files can be deleted.
-        // If this fails the next recovery will clean up; not critical.
         let wal_dir = self.state.config.db_root.join("wal");
         if let Err(e) = Wal::delete_files_through(&wal_dir, sealed_wal_id) {
-            error!("Failed to delete sealed WAL files <= {}: {} (will retry at next recovery)", sealed_wal_id, e);
+            error!("Failed to delete sealed WAL files <= {}: {} (recovery will retry)", sealed_wal_id, e);
         }
     }
 }
 
-/// Build a SegmentMeta covering all events in the batch.
-pub fn build_segment_meta(segment_id: &str, batch: &[UsageEvent]) -> SegmentMeta {
+fn rollback_partial(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Build a SegmentMeta covering all events in the batch with the given bucket.
+pub fn build_segment_meta(segment_id: &str, batch: &[UsageEvent], bucket: u32) -> SegmentMeta {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     let mut min_account: Option<String> = None;
@@ -122,7 +171,7 @@ pub fn build_segment_meta(segment_id: &str, batch: &[UsageEvent]) -> SegmentMeta
         kind: SegmentKind::Raw,
         min_timestamp_ms: if min_ts == i64::MAX { 0 } else { min_ts },
         max_timestamp_ms: if max_ts == i64::MIN { 0 } else { max_ts },
-        bucket: 0, // TODO: hash(account_id) % bucket_count
+        bucket,
         row_count: batch.len() as u64,
         min_account_id: min_account.map(AccountId),
         max_account_id: max_account.map(AccountId),
@@ -130,6 +179,6 @@ pub fn build_segment_meta(segment_id: &str, batch: &[UsageEvent]) -> SegmentMeta
         meter_ids,
         model_ids,
         quantity_sum: Some(quantity_sum),
-        checksum: 0, // TODO: CRC over segment bytes
+        checksum: 0, // TODO: CRC over segment bytes (waiting on columnar format)
     }
 }
