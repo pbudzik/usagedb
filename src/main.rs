@@ -2,11 +2,13 @@ use usagedb::runtime::config::Config;
 use usagedb::runtime::state::{AppStateInner, AppState};
 use usagedb::ingest::wal::Wal;
 use usagedb::ingest::flusher::FlusherWorker;
+use usagedb::rollup::worker::RollupWorker;
 use usagedb::api::http_server::start_server;
 use usagedb::runtime::recovery::Recovery;
 
-use tokio::sync::{RwLock, Mutex, mpsc};
+use tokio::sync::{RwLock, Mutex, Notify, mpsc};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, error};
 
 #[tokio::main]
@@ -41,6 +43,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (flush_sender, flush_receiver) = mpsc::channel(4);
 
+    let rollup_tick_interval = Duration::from_secs(config.rollup_tick_interval_secs);
+    let rollup_safety_lag_ms = config.rollup_safety_lag_ms;
+
     let state: AppState = Arc::new(AppStateInner {
         config,
         dedupe: Mutex::new(recovery_result.dedupe),
@@ -53,11 +58,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flusher = FlusherWorker::new(state.clone(), flush_receiver);
     let flusher_handle = tokio::spawn(flusher.run());
 
+    let rollup_shutdown = Arc::new(Notify::new());
+    let rollup_shutdown_signal = rollup_shutdown.clone();
+    let rollup_worker = RollupWorker::new(state.clone(), rollup_safety_lag_ms, rollup_tick_interval);
+    let rollup_handle = tokio::spawn(async move {
+        rollup_worker.run(rollup_shutdown_signal).await;
+    });
+
     start_server(state.clone()).await?;
 
     info!("Waiting for background tasks to finish...");
+    rollup_shutdown.notify_waiters();
     drop(state);
     let _ = flusher_handle.await;
+    let _ = rollup_handle.await;
 
     info!("Server gracefully shut down.");
     Ok(())
