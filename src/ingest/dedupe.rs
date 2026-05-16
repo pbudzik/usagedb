@@ -4,16 +4,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Default TTL of 7 days in milliseconds, covering typical retry windows.
 const DEFAULT_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
 
+/// Event identity hash: 128 bits derived from blake3, stable across Rust
+/// versions and large enough that birthday collisions are negligible at
+/// billing scale (~10^9 events ⇒ collision probability ≈ 2^-67).
+pub type EventHash = u128;
+
 #[derive(Debug, Clone)]
 pub struct DedupeEntry {
-    pub payload_hash: u64,
+    pub payload_hash: EventHash,
     pub first_seen_ms: i64,
 }
 
 pub struct HotDedupe {
-    cache: HashMap<u64, DedupeEntry>,
+    cache: HashMap<EventHash, DedupeEntry>,
     /// Insertion order for FIFO eviction when capacity is exceeded.
-    order: VecDeque<(u64, i64)>, // (event_id_hash, inserted_at_ms)
+    order: VecDeque<(EventHash, i64)>, // (event_id_hash, inserted_at_ms)
     max_capacity: usize,
     ttl_ms: i64,
 }
@@ -50,7 +55,7 @@ impl HotDedupe {
     /// Classify an event against the cache without mutating state. Used by
     /// the ingest hot path to decide whether to WAL-append before committing
     /// the dedupe entry.
-    pub fn classify(&self, event_id_hash: u64, payload_hash: u64) -> DedupeResult {
+    pub fn classify(&self, event_id_hash: EventHash, payload_hash: EventHash) -> DedupeResult {
         if let Some(existing) = self.cache.get(&event_id_hash) {
             if existing.payload_hash == payload_hash {
                 DedupeResult::ExactDuplicate
@@ -65,7 +70,7 @@ impl HotDedupe {
     /// Commit a previously-classified `NewEvent` into the cache. Safe to call
     /// after WAL durability has been established. No-op if a concurrent
     /// caller already inserted the same hash.
-    pub fn commit(&mut self, event_id_hash: u64, payload_hash: u64) {
+    pub fn commit(&mut self, event_id_hash: EventHash, payload_hash: EventHash) {
         self.evict_expired();
         if self.cache.contains_key(&event_id_hash) {
             return;
@@ -92,7 +97,7 @@ impl HotDedupe {
     /// Convenience wrapper that classifies and (if NewEvent) commits in one
     /// step. Used by tests; the hot path should call classify + commit
     /// separately around the WAL append.
-    pub fn check_and_insert(&mut self, event_id_hash: u64, payload_hash: u64) -> DedupeResult {
+    pub fn check_and_insert(&mut self, event_id_hash: EventHash, payload_hash: EventHash) -> DedupeResult {
         let result = self.classify(event_id_hash, payload_hash);
         if result == DedupeResult::NewEvent {
             self.commit(event_id_hash, payload_hash);
@@ -102,7 +107,7 @@ impl HotDedupe {
 
     /// Insert a known event during WAL replay without returning a dedupe result.
     /// This rebuilds the hot cache from durable state.
-    pub fn insert_known(&mut self, event_id_hash: u64, payload_hash: u64, first_seen_ms: i64) {
+    pub fn insert_known(&mut self, event_id_hash: EventHash, payload_hash: EventHash, first_seen_ms: i64) {
         if self.cache.contains_key(&event_id_hash) {
             return;
         }

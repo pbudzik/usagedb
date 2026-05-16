@@ -158,7 +158,7 @@ fn recovery_skips_sealed_files_below_watermark() {
 #[test]
 fn dedupe_classify_does_not_mutate() {
     let mut dedupe = HotDedupe::new(100);
-    let (h, p) = (123u64, 456u64);
+    let (h, p): (usagedb::ingest::dedupe::EventHash, usagedb::ingest::dedupe::EventHash) = (123, 456);
     // Classify alone should NOT register the event.
     assert_eq!(dedupe.classify(h, p), usagedb::ingest::dedupe::DedupeResult::NewEvent);
     assert_eq!(dedupe.classify(h, p), usagedb::ingest::dedupe::DedupeResult::NewEvent);
@@ -169,6 +169,34 @@ fn dedupe_classify_does_not_mutate() {
         dedupe.classify(h, p),
         usagedb::ingest::dedupe::DedupeResult::ExactDuplicate
     );
+}
+
+#[test]
+fn event_hash_is_deterministic_and_ignores_ingested_at() {
+    let mut e1 = make_event("evt_X", "acc", 1000, 50);
+    let mut e2 = e1.clone();
+    e1.ingested_at_ms = 1;
+    e2.ingested_at_ms = 999_999;
+
+    let (id1, payload1) = compute_event_hashes(&e1);
+    let (id2, payload2) = compute_event_hashes(&e2);
+    assert_eq!(id1, id2, "event_id hash must be deterministic");
+    assert_eq!(payload1, payload2, "payload hash must ignore ingested_at_ms");
+
+    // Same id_hash for the same event_id string across calls.
+    let e3 = make_event("evt_X", "different_account", 500, 1);
+    let (id3, _) = compute_event_hashes(&e3);
+    assert_eq!(id1, id3, "event_id hash must depend only on event_id");
+}
+
+#[test]
+fn event_hash_differs_for_different_payloads() {
+    let e1 = make_event("evt_A", "acc", 1000, 50);
+    let e2 = make_event("evt_A", "acc", 1000, 100); // different quantity
+    let (id1, payload1) = compute_event_hashes(&e1);
+    let (id2, payload2) = compute_event_hashes(&e2);
+    assert_eq!(id1, id2, "same event_id ⇒ same id hash");
+    assert_ne!(payload1, payload2, "different quantity ⇒ different payload hash");
 }
 
 #[test]
