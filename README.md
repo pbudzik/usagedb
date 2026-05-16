@@ -86,6 +86,8 @@ The ingest path runs three phases under a single critical section:
    - `Fast`: `flush` only — bytes hit the page cache but no disk round-trip; acceptable for at-least-once upstream retry pipelines.
 3. **Commit** dedupe entries and insert into the memtable.
 
+If the flusher fails to write a segment or commit the manifest, the drained events are **re-inserted into the memtable** so they get retried on the next flush trigger — they don't sit invisibly in a sealed WAL file until the next process restart.
+
 If step 2 fails, no dedupe state is mutated — client retries do not see false duplicates. The WAL is split across numbered files under `wal/`; on memtable overflow the active file is sealed and a new one is opened, then the flusher writes a segment, persists `last_sealed_wal_id` in the manifest, and deletes WAL files up to that id. Recovery cleans up stragglers, replays any unsealed files into both the dedupe cache and the memtable, **and** scans raw segments within the dedupe TTL window (7 days) to re-register their events — so retries across restart of previously-committed events are detected as duplicates, not accepted as new.
 
 The rollup worker advances the watermark under three safety bounds: (a) `time_target = floor((now - safety_lag) / 1h) * 1h`; (b) skip the tick if a flush is in flight (a sealed WAL file hasn't yet been committed to a raw segment); (c) cap by the floor-of-hour of the oldest event still in the memtable — the watermark never crosses unflushed data. If the memtable holds events older than `memtable_max_age_ms`, the rollup worker force-drains it so the watermark can resume.
@@ -101,8 +103,11 @@ What works end-to-end:
 - Columnar on-disk format with per-column zstd compression and blake3 checksum (see [Segment format](#segment-format))
 - Background hourly rollup scheduler — seals completed hours into per-bucket rollup segments, advances the manifest watermark atomically, query path routes `RollupHourly` through rollups with raw fallback for the open-period tail
 - Background compaction scheduler — merges small per-bucket segments into a single output, applies the `ReplacementRecord` to the manifest, deletes old files after a configurable reader grace period (spec §15.3)
-- Query executor: raw segments + memtable, filters, group-by, Sum/Count
-- SQL subset parser (`SELECT … FROM usage_events|usage_rollup_hourly WHERE … GROUP BY …`)
+- Query executor: raw segments + memtable, filters, group-by, Sum/Count; pruning uses `bucket(account_id)`, `min_account_id`/`max_account_id`, and per-segment `product_ids`/`meter_ids`/`model_ids` from `SegmentMeta` before opening segment files
+- Half-open `[from, to)` time-range semantics across all query paths so adjacent month queries don't double-count boundary events
+- SQL subset parser is strict — `SUM` accepts only `quantity`, `COUNT` accepts only `*`, ranges distinguish `<`/`<=` and `>`/`>=`, `OR`/`HAVING`/aliases/`SELECT *` are rejected explicitly rather than silently mapped
+- Fail-closed recovery on corrupt manifest (refuses to start instead of silently falling back to an empty manifest)
+- Shutdown drain — `ctrl+c` flushes the memtable before exiting
 
 Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 
