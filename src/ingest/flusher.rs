@@ -239,5 +239,9 @@ pub fn build_segment_meta(segment_id: &str, batch: &[UsageEvent], bucket: u32, c
         model_ids,
         quantity_sum: Some(quantity_sum),
         checksum,
+        // Raw segments have no inputs — they're the ground truth.
+        // Compacted segments also leave this empty; their provenance is
+        // tracked via Manifest.compacted_replacements.
+        input_segment_ids: Vec::new(),
     }
 }

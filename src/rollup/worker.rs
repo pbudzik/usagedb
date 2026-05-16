@@ -202,6 +202,13 @@ impl RollupWorker {
             let hour_end = hour + HOUR_MS;
 
             let mut by_bucket: HashMap<u32, RollupBuilder> = HashMap::new();
+            // Track per-bucket provenance: which raw segment IDs
+            // contributed events to each output rollup segment. Used to
+            // populate `SegmentMeta.input_segment_ids` so invoice
+            // lineage is auditable (spec §19.10).
+            let mut inputs_by_bucket: HashMap<u32, std::collections::BTreeSet<String>> =
+                HashMap::new();
+
             for seg in &raw_segments {
                 if seg.max_timestamp_ms < hour || seg.min_timestamp_ms >= hour_end {
                     continue;
@@ -225,6 +232,10 @@ impl RollupWorker {
                         continue;
                     }
                     by_bucket.entry(bucket).or_default().process_event(&event);
+                    inputs_by_bucket
+                        .entry(bucket)
+                        .or_default()
+                        .insert(seg.segment_id.clone());
                 }
             }
 
@@ -233,7 +244,12 @@ impl RollupWorker {
                 if records.is_empty() {
                     continue;
                 }
-                let (meta, path) = self.write_rollup_segment(records, bucket, hour, hour_end)?;
+                let inputs: Vec<String> = inputs_by_bucket
+                    .remove(&bucket)
+                    .map(|set| set.into_iter().collect())
+                    .unwrap_or_default();
+                let (meta, path) =
+                    self.write_rollup_segment(records, bucket, hour, hour_end, inputs)?;
                 new_segments.push((meta, path));
             }
 
@@ -331,6 +347,7 @@ impl RollupWorker {
         bucket: u32,
         hour_start: i64,
         hour_end: i64,
+        input_segment_ids: Vec<String>,
     ) -> anyhow::Result<(SegmentMeta, std::path::PathBuf)> {
         let segment_id = format!("rollup_{}", uuid::Uuid::new_v4().simple());
         let path = self
@@ -353,6 +370,7 @@ impl RollupWorker {
             hour_start,
             hour_end - 1,
             row_count,
+            input_segment_ids,
         );
         Ok((meta, path))
     }
@@ -366,6 +384,7 @@ fn build_rollup_segment_meta(
     min_ts: i64,
     max_ts: i64,
     row_count: u64,
+    input_segment_ids: Vec<String>,
 ) -> SegmentMeta {
     let mut product_ids = std::collections::HashSet::new();
     let mut meter_ids = std::collections::HashSet::new();
@@ -408,6 +427,7 @@ fn build_rollup_segment_meta(
         model_ids,
         quantity_sum: Some(quantity_sum),
         checksum,
+        input_segment_ids,
     }
 }
 

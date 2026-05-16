@@ -526,22 +526,35 @@ async fn handle_explain(
     let corrections = execute_plan(&state, &plan_corr).await;
 
     // Segment provenance from the manifest. Filtering by bucket here
-    // matches the executor's pruning — the same segments the query would
-    // open are the ones we report.
-    let (watermark_ms, rollup_segments, raw_segments) = {
+    // matches the executor's pruning. For each overlapping rollup
+    // segment we also surface its `input_segment_ids` so an operator
+    // can name every raw segment that contributed to a rollup line —
+    // spec §19.10 (invoice snapshots reference a watermark + source
+    // segment set).
+    let (watermark_ms, rollup_segments, rollup_inputs, raw_segments) = {
         let manifest = state.manifest.read().await;
         let bucket_count = manifest.bucket_count.max(1);
         let target_bucket = bucket_for_account(&AccountId(account_id.clone()), bucket_count);
-        let rollups: Vec<String> = manifest
-            .rollup_segments
-            .iter()
-            .filter(|s| {
-                s.bucket == target_bucket
-                    && s.min_timestamp_ms < to_ms
-                    && s.max_timestamp_ms >= from_ms
-            })
-            .map(|s| s.segment_id.clone())
-            .collect();
+        let mut rollup_ids = Vec::new();
+        let mut inputs_map = serde_json::Map::new();
+        for s in &manifest.rollup_segments {
+            if s.bucket != target_bucket
+                || s.min_timestamp_ms >= to_ms
+                || s.max_timestamp_ms < from_ms
+            {
+                continue;
+            }
+            rollup_ids.push(s.segment_id.clone());
+            inputs_map.insert(
+                s.segment_id.clone(),
+                serde_json::Value::Array(
+                    s.input_segment_ids
+                        .iter()
+                        .map(|id| serde_json::Value::String(id.clone()))
+                        .collect(),
+                ),
+            );
+        }
         let raws: Vec<String> = manifest
             .raw_segments
             .iter()
@@ -552,7 +565,12 @@ async fn handle_explain(
             })
             .map(|s| s.segment_id.clone())
             .collect();
-        (manifest.watermarks.hourly_rollup_ms, rollups, raws)
+        (
+            manifest.watermarks.hourly_rollup_ms,
+            rollup_ids,
+            inputs_map,
+            raws,
+        )
     };
 
     Ok(Json(serde_json::json!({
@@ -562,6 +580,7 @@ async fn handle_explain(
         "watermark_ms": watermark_ms,
         "lines": lines,
         "rollup_segments": rollup_segments,
+        "rollup_inputs": rollup_inputs,
         "raw_segments": raw_segments,
         "corrections": corrections,
     })))
