@@ -1,6 +1,7 @@
 // Storage module
 pub mod columns;
 pub mod compression;
+pub mod dedupe_index;
 pub mod encoding;
 pub mod manifest;
 pub mod segment_format;

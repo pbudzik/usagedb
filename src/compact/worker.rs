@@ -26,7 +26,9 @@ use tracing::{error, info, warn};
 use crate::compact::planner::{CompactionPlan, CompactionPlanner};
 use crate::ingest::flusher::build_segment_meta;
 use crate::model::event::UsageEvent;
+use crate::runtime::recovery::compute_event_hashes;
 use crate::runtime::state::AppState;
+use crate::storage::dedupe_index::{index_path, write_dedupe_index, DedupeEntry};
 use crate::storage::manifest::ReplacementRecord;
 use crate::storage::segment_reader::RawSegmentReader;
 use crate::storage::segment_writer::RawSegmentWriter;
@@ -149,6 +151,21 @@ impl CompactionWorker {
             }
         };
         let new_meta = build_segment_meta(&output_id, &deduped, plan.bucket, checksum);
+
+        // Write the dedupe sidecar for the compacted output too — same
+        // recovery speedup applies. Non-fatal on failure.
+        let idx_entries: Vec<DedupeEntry> = deduped
+            .iter()
+            .map(|e| {
+                let (id_h, p_h) = compute_event_hashes(e);
+                (id_h, p_h, e.ingested_at_ms)
+            })
+            .collect();
+        let idx = index_path(db_root, &output_id);
+        if let Err(e) = write_dedupe_index(&idx, &idx_entries) {
+            warn!("compaction: dedupe sidecar write for {} failed: {}", output_id, e);
+            let _ = std::fs::remove_file(&idx);
+        }
 
         // Atomically swap old → new in the manifest.
         let committed = {

@@ -6,6 +6,7 @@ use crate::ingest::wal::Wal;
 use crate::ingest::dedupe::{HotDedupe, DEFAULT_TTL_MS};
 use crate::ingest::memtable::Memtable;
 use crate::model::event::UsageEvent;
+use crate::storage::dedupe_index::{index_path, read_dedupe_index};
 use crate::storage::segment_reader::RawSegmentReader;
 use std::io::Result as IoResult;
 use tracing::{info, warn};
@@ -101,6 +102,12 @@ impl Recovery {
         let cutoff = now_ms_recovery().saturating_sub(DEFAULT_TTL_MS);
         let mut segments_scanned = 0usize;
         let mut events_registered = 0usize;
+        // Track how many segments used the fast sidecar path vs the
+        // segment-scan fallback, so we can spot when sidecars are
+        // missing (e.g., after upgrading from a build that didn't write them).
+        let mut sidecar_hits = 0usize;
+        let mut sidecar_misses = 0usize;
+
         for seg in &manifest.raw_segments {
             if seg.max_timestamp_ms < cutoff {
                 continue;
@@ -113,6 +120,32 @@ impl Recovery {
                 );
                 continue;
             }
+
+            // Fast path: try the sidecar `.idx` file. It carries the
+            // same (id_hash, payload_hash, ingested_at_ms) triples in
+            // segment row order, without bincode-decoding the event
+            // column. Falls through to the slow path on missing or
+            // corrupt sidecar.
+            let idx = index_path(&self.db_root, &seg.segment_id);
+            let sidecar = match read_dedupe_index(&idx) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("recovery: dedupe sidecar for {} unusable ({}); falling back to scan", seg.segment_id, e);
+                    None
+                }
+            };
+            if let Some(entries) = sidecar {
+                for (id_hash, payload_hash, ingested_at_ms) in entries {
+                    dedupe.insert_known(id_hash, payload_hash, ingested_at_ms);
+                    events_registered += 1;
+                }
+                sidecar_hits += 1;
+                segments_scanned += 1;
+                continue;
+            }
+
+            // Slow path: open the segment and rehash each event.
+            sidecar_misses += 1;
             match RawSegmentReader::new(path) {
                 Ok(mut reader) => {
                     loop {
@@ -133,6 +166,12 @@ impl Recovery {
                 }
                 Err(e) => warn!("recovery: failed to open segment {}: {}", seg.segment_id, e),
             }
+        }
+        if segments_scanned > 0 {
+            info!(
+                "Dedupe rebuild: sidecar hits {}, fallback scans {}",
+                sidecar_hits, sidecar_misses
+            );
         }
         if segments_scanned > 0 {
             info!(

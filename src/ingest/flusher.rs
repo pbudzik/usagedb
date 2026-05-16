@@ -3,8 +3,10 @@ use tokio::sync::mpsc;
 use tracing::{info, error};
 use crate::model::event::UsageEvent;
 use crate::model::ids::{AccountId, bucket_for_account};
+use crate::storage::dedupe_index::{index_path, write_dedupe_index, DedupeEntry};
 use crate::storage::segment_writer::RawSegmentWriter;
 use crate::storage::manifest::{SegmentMeta, SegmentKind};
+use crate::runtime::recovery::compute_event_hashes;
 use crate::ingest::wal::Wal;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -174,11 +176,16 @@ impl FlusherWorker {
             Ok(w) => w,
             Err(e) => return Err(format!("create segment for bucket {}: {}", bucket, e)),
         };
+        let mut index_entries: Vec<DedupeEntry> = Vec::with_capacity(sorted.len());
         for event in &sorted {
             if let Err(e) = writer.write_event(event) {
                 let _ = std::fs::remove_file(&path);
                 return Err(format!("write event to bucket {} segment {}: {}", bucket, segment_id, e));
             }
+            // Build the per-row dedupe sidecar entry so recovery can
+            // skip the bincode + zstd decode of the event column.
+            let (id_hash, payload_hash) = compute_event_hashes(event);
+            index_entries.push((id_hash, payload_hash, event.ingested_at_ms));
         }
         let (_row_count, checksum) = match writer.finish() {
             Ok(t) => t,
@@ -187,6 +194,18 @@ impl FlusherWorker {
                 return Err(format!("finish bucket {} segment {}: {}", bucket, segment_id, e));
             }
         };
+
+        // Write the dedupe sidecar. Failure here is non-fatal —
+        // recovery falls back to scanning the segment — but we log it
+        // and clean up so it doesn't leave a half-written file behind.
+        let idx_path = index_path(&self.state.config.db_root, &segment_id);
+        if let Err(e) = write_dedupe_index(&idx_path, &index_entries) {
+            tracing::warn!(
+                "flusher: dedupe sidecar write for {} failed: {} — segment is fine, recovery will scan",
+                segment_id, e
+            );
+            let _ = std::fs::remove_file(&idx_path);
+        }
 
         Ok((build_segment_meta(&segment_id, &sorted, bucket, checksum), path))
     }
