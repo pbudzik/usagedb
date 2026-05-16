@@ -15,6 +15,13 @@ pub struct Config {
     /// Spec §5.2 recommends 64 for small installs, 256 for medium, 512+
     /// for large.
     pub default_bucket_count: u32,
+    /// How often the background rollup worker checks for new hours to seal.
+    pub rollup_tick_interval_secs: u64,
+    /// Number of milliseconds to wait past an hour boundary before treating
+    /// the hour as sealed for rollup. Allows in-flight events from that
+    /// hour to land in raw segments first. Spec §11.3 covers the open-period
+    /// query handling; this lag is the bound on "open period" duration.
+    pub rollup_safety_lag_ms: i64,
 }
 
 impl Default for Config {
@@ -25,6 +32,8 @@ impl Default for Config {
             http_bind_address: "127.0.0.1:8080".to_string(),
             dedupe_capacity: 1_000_000,
             default_bucket_count: 64,
+            rollup_tick_interval_secs: 30,
+            rollup_safety_lag_ms: 60_000, // 1 minute
         }
     }
 }
