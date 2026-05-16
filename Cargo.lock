@@ -1205,6 +1205,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
+ "http-body-util",
  "hyper",
  "lz4_flex",
  "memmap2",

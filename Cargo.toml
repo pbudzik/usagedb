@@ -31,3 +31,4 @@ zstd = "0.13.3"
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.27.0"
+http-body-util = "0.1"

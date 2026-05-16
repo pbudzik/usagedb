@@ -21,19 +21,7 @@ use crate::runtime::state::{AppState, FlushMessage};
 use crate::runtime::config::DurabilityMode;
 
 pub async fn start_server(state: AppState) -> Result<(), std::io::Error> {
-    let app = Router::new()
-        .route("/health", get(|| async { "OK" }))
-        // Spec §9.1 — canonical path.
-        .route("/v1/usage/batch", post(handle_ingest))
-        // Spec §12.2 — account usage with query params.
-        .route("/v1/accounts/{account_id}/usage", get(handle_account_usage))
-        // Spec §12.3 — raw audit query.
-        .route("/v1/accounts/{account_id}/usage/events", get(handle_account_events))
-        // Flexible POST query for arbitrary filter shapes.
-        .route("/v1/query/json", post(handle_query_json))
-        // SQL subset endpoint.
-        .route("/v1/query/sql", post(handle_query_sql))
-        .with_state(state.clone());
+    let app = build_router(state.clone());
 
     let addr: SocketAddr = state.config.http_bind_address.parse().unwrap();
     info!("Starting HTTP server on {}", addr);
@@ -42,6 +30,28 @@ pub async fn start_server(state: AppState) -> Result<(), std::io::Error> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
+}
+
+/// Construct the axum Router with all routes wired up. Exposed so
+/// integration tests can drive endpoints via `tower::oneshot` without
+/// binding a port.
+pub fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(|| async { "OK" }))
+        // Spec §9.1 — canonical path.
+        .route("/v1/usage/batch", post(handle_ingest))
+        // Spec §12.2 — account usage with query params.
+        .route("/v1/accounts/{account_id}/usage", get(handle_account_usage))
+        // Spec §12.3 — raw audit query.
+        .route("/v1/accounts/{account_id}/usage/events", get(handle_account_events))
+        // Phase D operability — explain a total and verify rollup-vs-raw drift.
+        .route("/v1/accounts/{account_id}/explain", get(handle_explain))
+        .route("/v1/accounts/{account_id}/verify", get(handle_verify))
+        // Flexible POST query for arbitrary filter shapes.
+        .route("/v1/query/json", post(handle_query_json))
+        // SQL subset endpoint.
+        .route("/v1/query/sql", post(handle_query_sql))
+        .with_state(state)
 }
 
 pub struct AppError(anyhow::Error);
@@ -439,6 +449,205 @@ async fn handle_query_sql(
         .map_err(|e| AppError(anyhow::anyhow!("SQL parse error: {}", e)))?;
     let results = execute_plan(&state, &plan).await;
     Ok(Json(serde_json::json!({ "data": results })))
+}
+
+/// Phase D operability: `GET /v1/accounts/{account_id}/explain?from&to`
+///
+/// Returns the breakdown that contributed to an account's total over a
+/// time range — broken out by `(product, meter, model, source, unit)`,
+/// plus the list of rollup and raw segment IDs that overlap the range
+/// (so an operator can drill into them via `inspect-segment` later), plus
+/// the corrections / retractions that affected the total separately.
+///
+/// This is the spec's "explain a billing total" primitive — without it,
+/// a disagreement between dashboard and invoice is hard to investigate.
+#[derive(serde::Deserialize, Default)]
+struct ExplainParams {
+    from: String,
+    to: String,
+}
+
+async fn handle_explain(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Query(params): Query<ExplainParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use chrono::DateTime;
+    use crate::query::executor::execute_plan;
+    use crate::query::plan::{AggregationFunction, QueryFilter, QueryPlan, QuerySource};
+    use crate::model::ids::{AccountId, bucket_for_account};
+
+    let from_ms = DateTime::parse_from_rfc3339(&params.from)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| AppError(anyhow::anyhow!("invalid `from`: {}", e)))?;
+    let to_ms = DateTime::parse_from_rfc3339(&params.to)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| AppError(anyhow::anyhow!("invalid `to`: {}", e)))?;
+
+    // Breakdown via the rollup path (with raw fallback for the open-period
+    // tail). Group by every billing-relevant column so each row is a
+    // distinct invoice line.
+    let mut metrics = HashMap::new();
+    metrics.insert("quantity".to_string(), AggregationFunction::Sum);
+    metrics.insert("count".to_string(), AggregationFunction::Count);
+    let plan = QueryPlan {
+        source: QuerySource::RollupHourly,
+        account_id: Some(account_id.clone()),
+        from_ms,
+        to_ms,
+        filters: vec![],
+        group_by: vec![
+            "product_id".into(),
+            "meter_id".into(),
+            "model_id".into(),
+            "source".into(),
+            "unit".into(),
+        ],
+        metrics,
+        limit: None,
+    };
+    let lines = execute_plan(&state, &plan).await;
+
+    // Corrections + retractions in the range, returned as raw rows for
+    // forensic inspection. Empty for Usage-only periods.
+    let plan_corr = QueryPlan {
+        source: QuerySource::RawEvents,
+        account_id: Some(account_id.clone()),
+        from_ms,
+        to_ms,
+        filters: vec![QueryFilter {
+            field: "kind".into(),
+            values: vec!["Correction".into(), "Retraction".into()],
+        }],
+        group_by: vec![],
+        metrics: HashMap::new(),
+        limit: None,
+    };
+    let corrections = execute_plan(&state, &plan_corr).await;
+
+    // Segment provenance from the manifest. Filtering by bucket here
+    // matches the executor's pruning — the same segments the query would
+    // open are the ones we report.
+    let (watermark_ms, rollup_segments, raw_segments) = {
+        let manifest = state.manifest.read().await;
+        let bucket_count = manifest.bucket_count.max(1);
+        let target_bucket = bucket_for_account(&AccountId(account_id.clone()), bucket_count);
+        let rollups: Vec<String> = manifest
+            .rollup_segments
+            .iter()
+            .filter(|s| {
+                s.bucket == target_bucket
+                    && s.min_timestamp_ms < to_ms
+                    && s.max_timestamp_ms >= from_ms
+            })
+            .map(|s| s.segment_id.clone())
+            .collect();
+        let raws: Vec<String> = manifest
+            .raw_segments
+            .iter()
+            .filter(|s| {
+                s.bucket == target_bucket
+                    && s.min_timestamp_ms < to_ms
+                    && s.max_timestamp_ms >= from_ms
+            })
+            .map(|s| s.segment_id.clone())
+            .collect();
+        (manifest.watermarks.hourly_rollup_ms, rollups, raws)
+    };
+
+    Ok(Json(serde_json::json!({
+        "account_id": account_id,
+        "from_ms": from_ms,
+        "to_ms": to_ms,
+        "watermark_ms": watermark_ms,
+        "lines": lines,
+        "rollup_segments": rollup_segments,
+        "raw_segments": raw_segments,
+        "corrections": corrections,
+    })))
+}
+
+/// Phase D operability: `GET /v1/accounts/{account_id}/verify?from&to`
+///
+/// Computes the same SUM(quantity) two ways — through the rollup path
+/// and through a pure raw scan — and reports both totals plus the
+/// `drift = raw - rollup`. Drift of zero on a fully-sealed period
+/// (where `to <= watermark_ms`) is the invariant; non-zero indicates a
+/// rollup bug, a late event that landed below the watermark, or a
+/// missing rollup segment that operator-driven `rebuild_rollups` should
+/// fix.
+#[derive(serde::Deserialize, Default)]
+struct VerifyParams {
+    from: String,
+    to: String,
+}
+
+async fn handle_verify(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Query(params): Query<VerifyParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use chrono::DateTime;
+    use crate::query::executor::execute_plan;
+    use crate::query::plan::{AggregationFunction, QueryPlan, QuerySource};
+
+    let from_ms = DateTime::parse_from_rfc3339(&params.from)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| AppError(anyhow::anyhow!("invalid `from`: {}", e)))?;
+    let to_ms = DateTime::parse_from_rfc3339(&params.to)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| AppError(anyhow::anyhow!("invalid `to`: {}", e)))?;
+
+    let mut metrics = HashMap::new();
+    metrics.insert("quantity".to_string(), AggregationFunction::Sum);
+
+    let plan_raw = QueryPlan {
+        source: QuerySource::RawEvents,
+        account_id: Some(account_id.clone()),
+        from_ms,
+        to_ms,
+        filters: vec![],
+        group_by: vec![],
+        metrics: metrics.clone(),
+        limit: None,
+    };
+    let plan_rollup = QueryPlan {
+        source: QuerySource::RollupHourly,
+        ..plan_raw.clone()
+    };
+
+    let raw_result = execute_plan(&state, &plan_raw).await;
+    let rollup_result = execute_plan(&state, &plan_rollup).await;
+
+    let raw_total = extract_quantity_sum(&raw_result);
+    let rollup_total = extract_quantity_sum(&rollup_result);
+    let drift = raw_total.saturating_sub(rollup_total);
+    let watermark_ms = state.manifest.read().await.watermarks.hourly_rollup_ms;
+    let period_sealed = to_ms <= watermark_ms;
+
+    Ok(Json(serde_json::json!({
+        "account_id": account_id,
+        "from_ms": from_ms,
+        "to_ms": to_ms,
+        "watermark_ms": watermark_ms,
+        "period_sealed": period_sealed,
+        "raw_total": raw_total.to_string(),
+        "rollup_total": rollup_total.to_string(),
+        "drift": drift.to_string(),
+        "matches": drift == 0,
+    })))
+}
+
+/// Pull SUM(quantity) out of an executor result. Returns 0 when the
+/// result is empty (e.g., no events in range).
+fn extract_quantity_sum(result: &[serde_json::Value]) -> i128 {
+    result
+        .iter()
+        .filter_map(|v| v.get("quantity"))
+        .filter_map(|v| v.as_str())
+        .filter_map(|s| s.parse().ok())
+        .next()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
