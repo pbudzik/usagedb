@@ -59,9 +59,9 @@ GET  /v1/accounts/{account_id}/usage            ?from&to&group_by&product_id&met
 GET  /v1/accounts/{account_id}/usage/events     ?from&to&meter_id&product_id
 GET  /v1/accounts/{account_id}/explain          ?from&to       — breakdown + segment provenance + corrections
 GET  /v1/accounts/{account_id}/verify           ?from&to       — raw-vs-rollup drift check
-GET  /v1/accounts/{account_id}/periods/{YYYY-MM}                       — state + total
-POST /v1/accounts/{account_id}/periods/{YYYY-MM}/close                 — mark closed
-POST /v1/accounts/{account_id}/periods/{YYYY-MM}/reopen                — mark open
+GET  /v1/accounts/{account_id}/periods/{YYYY-MM}                       — open: live total; closed: frozen snapshot + pending adjustments + net total
+POST /v1/accounts/{account_id}/periods/{YYYY-MM}/close                 — capture frozen snapshot + mark closed
+POST /v1/accounts/{account_id}/periods/{YYYY-MM}/reopen                — mark open (frozen snapshot is discarded)
 POST /v1/query/json                             { "source", "account_id", "from", "to", "group_by", "filters", "metrics" }
 POST /v1/query/sql                              { "query": "SELECT meter_id, SUM(quantity) FROM usage_events WHERE account_id = '...' GROUP BY meter_id" }
 GET  /health
@@ -70,6 +70,17 @@ GET  /health
 `from` / `to` are RFC 3339. Supported `metrics`: `sum`, `count`. Supported group keys: column names (`account_id`, `product_id`, `meter_id`, `model_id`, `source`, `unit`), `hour_start_ms`, `day`, or any dimension key. The account-usage GET defaults `source=rollup` for fast monthly totals; pass `source=raw` to force a raw scan.
 
 Ingest response counts `accepted`, `duplicates` (same id + same payload), `conflicts` (same id + different payload — surfaces silent collector bugs), and `rejected` (validation failures: missing required IDs, non-positive timestamp, >16 dimensions, Correction/Retraction without `correction_ref`, or `Usage` event landing in a closed period).
+
+### Period lifecycle
+
+Closing a period captures a **frozen snapshot** — `(frozen_quantity, frozen_event_count, watermark_at_close_ms)` — stored on the `ClosedPeriod` manifest entry. From then on:
+
+- New `Usage` events in the closed period are **rejected** at ingest.
+- `Correction` / `Retraction` events are still **accepted** and tracked as `pending_adjustments`.
+- `GET /periods/{YYYY-MM}` returns the frozen snapshot, the list of pending adjustments, the summed `adjustments_quantity`, and `net_total = frozen.quantity + adjustments_quantity` — the value an invoice would show today.
+- Reopening discards the frozen snapshot and the period returns to a live total.
+
+Entries closed before snapshot support fall back to a live total with a `warning` field.
 
 ## Building and running
 
@@ -131,8 +142,10 @@ What works end-to-end:
 - Manifest generations under `manifest/` (`CURRENT` + `manifest-NNNNNN.json`) with auto-migration from a legacy single-file `manifest.json`. Recovery rolls back to the previous valid generation if the current one is corrupt; falls fully closed only if no generation parses. The last 10 generations are retained.
 - Operator-facing `RollupWorker::rebuild_rollups(from_ms, to_ms)` — drops rollup segments overlapping the range, rewinds the watermark to `from_ms`, lets the next tick refill the gap from raw events. Used when a rollup bug is fixed, late data arrives for a sealed hour, or to verify rollup-vs-raw drift.
 - Correction / Retraction events work end-to-end: validation requires `correction_ref`, the rollup builder treats negative-quantity corrections as net adjustments (so SUM = original + correction), and queries can filter or group by `kind` to isolate adjustments for forensics.
+- Period lifecycle (Open ↔ Closed) with **frozen-snapshot semantics**: closing a period captures `(frozen_quantity, frozen_event_count, watermark_at_close_ms)` on the manifest entry; closed-period queries return the frozen snapshot + pending Correction/Retraction adjustments + `net_total`, so an invoice line stays stable even as late corrections trickle in. New `Usage` events in a closed period are rejected; reopening discards the frozen snapshot.
 - Shutdown drain — `ctrl+c` flushes the memtable before exiting
 - proptest property tests for spec §19 invariants (`tests/properties.rs`): raw=rollup totals, dedupe idempotence under retry, compaction-preserves-sum, recovery-preserves-sum (with and without prior flush), rollup-tick idempotence, payload-conflict detection — 32 randomized cases per property, regenerated on every CI run
+- Deterministic Simulation Testing (`tests/dst.rs`): state-machine driver that runs random sequences of `Ingest / Flush / RollupTick / CompactTick / Restart / ClosePeriod` ops against a parallel reference model, asserting `raw == model` after every step and `raw == rollup` at the end. Failures shrink to the minimum-length op trace, so any §19 violation surfaces as a reproducible recipe.
 
 Manifest layout (Phase A — generations):
 
