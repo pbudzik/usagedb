@@ -14,6 +14,14 @@ pub struct FlusherWorker {
     receiver: mpsc::Receiver<FlushMessage>,
 }
 
+/// Returned by `attempt_flush` when something goes wrong. `events` is the
+/// set of events that were not durably committed and should be retried;
+/// the caller (`handle_message`) re-inserts them into the memtable.
+struct FlushFailure {
+    events: Vec<UsageEvent>,
+    reason: String,
+}
+
 impl FlusherWorker {
     pub fn new(state: AppState, receiver: mpsc::Receiver<FlushMessage>) -> Self {
         Self { state, receiver }
@@ -33,9 +41,30 @@ impl FlusherWorker {
             return;
         }
 
-        // Partition events by bucket so each segment covers a single
-        // (date_partition_implicit_via_ts, bucket). Mixed-account batches
-        // are split into one segment per bucket they touch.
+        // On any pre-commit failure path the flush worker re-inserts the
+        // events into the memtable so they'll be retried on the next
+        // flush trigger (review P1 #1). Without this they sit in the
+        // sealed WAL file and are invisible to queries until restart.
+        if let Err(failure) = self.attempt_flush(events, sealed_wal_id).await {
+            error!(
+                "Flush failed: {} — re-inserting {} events into memtable for retry",
+                failure.reason,
+                failure.events.len()
+            );
+            if !failure.events.is_empty() {
+                let mut memtable = self.state.memtable.lock().await;
+                for event in failure.events {
+                    memtable.insert(event);
+                }
+            }
+        }
+    }
+
+    async fn attempt_flush(
+        &self,
+        events: Vec<UsageEvent>,
+        sealed_wal_id: u64,
+    ) -> Result<(), FlushFailure> {
         let bucket_count = {
             let manifest = self.state.manifest.read().await;
             manifest.bucket_count.max(1)
@@ -50,54 +79,31 @@ impl FlusherWorker {
             by_bucket.len(), sealed_wal_id
         );
 
-        // Write each bucket's segment + collect metas. We update the
-        // manifest once at the end so the sealed-wal pointer advances
-        // atomically with all segments from this drain.
         let mut new_metas: Vec<SegmentMeta> = Vec::with_capacity(by_bucket.len());
         let mut written_paths: Vec<PathBuf> = Vec::with_capacity(by_bucket.len());
 
-        for (bucket, bucket_events) in by_bucket {
-            let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
-            let path = self.state.config.db_root.join(format!("{}.seg", segment_id));
-
-            let mut writer = match RawSegmentWriter::new(path.clone()) {
-                Ok(w) => w,
-                Err(e) => {
-                    error!("Failed to create segment writer for bucket {}: {}", bucket, e);
-                    rollback_partial(&written_paths);
-                    return;
+        let buckets: Vec<u32> = by_bucket.keys().copied().collect();
+        for bucket in buckets {
+            let bucket_events = by_bucket.remove(&bucket).unwrap();
+            match self.write_bucket(bucket, &bucket_events) {
+                Ok((meta, path)) => {
+                    new_metas.push(meta);
+                    written_paths.push(path);
                 }
-            };
-            let mut write_failed = false;
-            for event in &bucket_events {
-                if let Err(e) = writer.write_event(event) {
-                    error!("Failed to write event to bucket {} segment {}: {}", bucket, segment_id, e);
-                    write_failed = true;
-                    break;
+                Err(reason) => {
+                    rollback_partial(&written_paths);
+                    let mut remaining = bucket_events;
+                    for (_, evs) in by_bucket {
+                        remaining.extend(evs);
+                    }
+                    return Err(FlushFailure { events: remaining, reason });
                 }
             }
-            if write_failed {
-                let _ = std::fs::remove_file(&path);
-                rollback_partial(&written_paths);
-                return;
-            }
-            let (_row_count, checksum) = match writer.finish() {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("Failed to finish bucket {} segment {}: {}", bucket, segment_id, e);
-                    let _ = std::fs::remove_file(&path);
-                    rollback_partial(&written_paths);
-                    return;
-                }
-            };
-
-            new_metas.push(build_segment_meta(&segment_id, &bucket_events, bucket, checksum));
-            written_paths.push(path);
         }
 
-        // All bucket segments are durable on disk. Commit the manifest
-        // atomically with the WAL seal pointer.
-        {
+        // All bucket segments are durable. Commit the manifest atomically
+        // with the WAL seal pointer.
+        let save_result = {
             let mut manifest = self.state.manifest.write().await;
             for meta in &new_metas {
                 manifest.raw_segments.push(meta.clone());
@@ -105,13 +111,26 @@ impl FlusherWorker {
             if sealed_wal_id > manifest.last_sealed_wal_id {
                 manifest.last_sealed_wal_id = sealed_wal_id;
             }
-            if let Err(e) = manifest.save(&self.state.config.db_root) {
-                error!(
-                    "Failed to save manifest after flush: {} — segments are on disk but unreferenced; will be cleaned up by recovery",
-                    e
-                );
-                return;
-            }
+            manifest.save(&self.state.config.db_root)
+        };
+
+        if let Err(e) = save_result {
+            // Manifest save failed. The segments we wrote are orphaned;
+            // remove them. The events themselves are still durable in the
+            // sealed WAL file (we haven't called delete_files_through),
+            // so the right thing is to surface an empty retry list —
+            // recovery will replay the WAL on next start and the next
+            // flusher message will re-attempt. Returning the events here
+            // would risk a double-flush on restart.
+            rollback_partial(&written_paths);
+            return Err(FlushFailure {
+                events: Vec::new(),
+                reason: format!(
+                    "manifest save: {} — segment files orphaned and removed; \
+                     events still durable in WAL file {} for recovery to replay",
+                    e, sealed_wal_id
+                ),
+            });
         }
 
         info!(
@@ -123,8 +142,44 @@ impl FlusherWorker {
 
         let wal_dir = self.state.config.db_root.join("wal");
         if let Err(e) = Wal::delete_files_through(&wal_dir, sealed_wal_id) {
-            error!("Failed to delete sealed WAL files <= {}: {} (recovery will retry)", sealed_wal_id, e);
+            error!(
+                "Failed to delete sealed WAL files <= {}: {} (recovery will retry)",
+                sealed_wal_id, e
+            );
         }
+        Ok(())
+    }
+
+    /// Write one bucket's segment + return its metadata. Returns Err with
+    /// a human-readable reason on any failure; the caller cleans up the
+    /// partial file and any earlier bucket segments via `rollback_partial`.
+    fn write_bucket(
+        &self,
+        bucket: u32,
+        bucket_events: &[UsageEvent],
+    ) -> Result<(SegmentMeta, PathBuf), String> {
+        let segment_id = format!("raw_{}", uuid::Uuid::new_v4().simple());
+        let path = self.state.config.db_root.join(format!("{}.seg", segment_id));
+
+        let mut writer = match RawSegmentWriter::new(path.clone()) {
+            Ok(w) => w,
+            Err(e) => return Err(format!("create segment for bucket {}: {}", bucket, e)),
+        };
+        for event in bucket_events {
+            if let Err(e) = writer.write_event(event) {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("write event to bucket {} segment {}: {}", bucket, segment_id, e));
+            }
+        }
+        let (_row_count, checksum) = match writer.finish() {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("finish bucket {} segment {}: {}", bucket, segment_id, e));
+            }
+        };
+
+        Ok((build_segment_meta(&segment_id, bucket_events, bucket, checksum), path))
     }
 }
 

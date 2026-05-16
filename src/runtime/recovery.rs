@@ -28,23 +28,32 @@ impl Recovery {
     pub fn run_startup_recovery(&self, dedupe_capacity: usize) -> IoResult<RecoveryResult> {
         info!("Starting recovery...");
 
-        // 1. Load manifest
+        // 1. Load manifest. Fail closed on corruption — a silent fallback
+        //    to Manifest::default would orphan every committed segment and
+        //    make the DB look empty, which for a billing database is a
+        //    far worse outcome than refusing to start (review P1 #2).
         let manifest_path = self.db_root.join("manifest.json");
         let manifest: Manifest = if manifest_path.exists() {
             let data = fs::read_to_string(&manifest_path)?;
-            match serde_json::from_str(&data) {
+            match serde_json::from_str::<Manifest>(&data) {
                 Ok(m) => {
-                    info!("Loaded manifest with {} raw segments",
-                        { let m: &Manifest = &m; m.raw_segments.len() });
+                    info!("Loaded manifest with {} raw segments", m.raw_segments.len());
                     m
                 }
                 Err(e) => {
-                    warn!("Corrupt manifest, starting fresh: {}", e);
-                    Manifest::default()
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Corrupt manifest at {:?}: {}. Refusing to start — \
+                             back up the file and inspect manually before retrying. \
+                             Restoring from a sibling manifest.json.tmp may recover.",
+                            manifest_path, e
+                        ),
+                    ));
                 }
             }
         } else {
-            info!("No manifest found, starting fresh");
+            info!("No manifest found, starting fresh DB");
             Manifest::default()
         };
 

@@ -89,6 +89,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     start_server(state.clone()).await?;
 
+    // Shutdown flush (review P1 #6): drain the memtable + rotate the WAL
+    // so any events accumulated since the last size-based flush become
+    // durable raw segments instead of staying stranded in WAL files.
+    {
+        let drain_msg = {
+            let mut wal = state.wal.lock().await;
+            let mut memtable = state.memtable.lock().await;
+            if memtable.is_empty() {
+                None
+            } else {
+                info!("Shutdown drain: {} events in memtable", memtable.len());
+                let events = memtable.drain_all();
+                match wal.rotate() {
+                    Ok(sealed_id) => Some(usagedb::runtime::state::FlushMessage {
+                        events,
+                        sealed_wal_id: sealed_id,
+                    }),
+                    Err(e) => {
+                        error!("Shutdown drain: WAL rotate failed: {} — events stay in WAL for recovery", e);
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(msg) = drain_msg {
+            if let Err(e) = state.flush_sender.send(msg).await {
+                error!("Shutdown drain: flusher channel closed: {}", e);
+            }
+        }
+    }
+
     info!("Waiting for background tasks to finish...");
     rollup_shutdown.notify_waiters();
     compaction_shutdown.notify_waiters();

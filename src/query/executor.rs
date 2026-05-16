@@ -3,13 +3,14 @@ use crate::runtime::state::AppState;
 use crate::model::event::{EventKind, UsageEvent};
 use crate::model::dimensions::SmallDimensions;
 use crate::model::ids::{
-    AccountId, EventId, MeterId, ModelId, ProductId, SubscriptionId,
+    AccountId, EventId, MeterId, ModelId, ProductId, SubscriptionId, bucket_for_account,
 };
 use crate::rollup::hourly::HourlyRollupRecord;
 use crate::rollup::reader::RollupSegmentReader;
+use crate::storage::manifest::SegmentMeta;
 use crate::storage::segment_reader::RawSegmentReader;
 use serde_json::{Value, Map};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use tracing::warn;
 
 /// Execute a query plan. RawEvents queries scan raw segments + the live
@@ -36,7 +37,7 @@ async fn collect_events(state: &AppState, plan: &QueryPlan) -> Vec<UsageEvent> {
 
 async fn collect_raw_events(
     state: &AppState,
-    _plan: &QueryPlan,
+    plan: &QueryPlan,
     from_ms: i64,
     to_ms: i64,
 ) -> Vec<UsageEvent> {
@@ -44,15 +45,18 @@ async fn collect_raw_events(
 
     // Snapshot the manifest under a read lock, then release before file I/O.
     // Segment files are immutable so reads outside the lock are safe.
-    let segment_paths: Vec<std::path::PathBuf> = {
+    let (segment_paths, bucket_count) = {
         let manifest = state.manifest.read().await;
-        manifest
+        let bc = manifest.bucket_count.max(1);
+        let paths: Vec<std::path::PathBuf> = manifest
             .raw_segments
             .iter()
-            .filter(|s| s.min_timestamp_ms <= to_ms && s.max_timestamp_ms >= from_ms)
+            .filter(|s| segment_overlaps_plan(s, plan, from_ms, to_ms, bc))
             .map(|s| state.config.db_root.join(format!("{}.seg", s.segment_id)))
-            .collect()
+            .collect();
+        (paths, bc)
     };
+    let _ = bucket_count; // kept for future use (e.g. parallel scan)
 
     for path in segment_paths {
         if !path.exists() {
@@ -63,12 +67,8 @@ async fn collect_raw_events(
             Ok(mut reader) => loop {
                 match reader.read_next() {
                     Ok(Some(e)) => {
-                        // Per-event time filter: a segment can overlap the
-                        // range without all its events being in range, and
-                        // the rollup-fallback path passes a `from_ms`
-                        // narrower than `plan.from_ms` to avoid double-
-                        // counting events already in rollup segments.
-                        if e.timestamp_ms >= from_ms && e.timestamp_ms <= to_ms {
+                        // Half-open [from, to) per spec convention.
+                        if e.timestamp_ms >= from_ms && e.timestamp_ms < to_ms {
                             events.push(e);
                         }
                     }
@@ -87,7 +87,7 @@ async fn collect_raw_events(
     {
         let memtable = state.memtable.lock().await;
         for e in memtable.snapshot() {
-            if e.timestamp_ms >= from_ms && e.timestamp_ms <= to_ms {
+            if e.timestamp_ms >= from_ms && e.timestamp_ms < to_ms {
                 events.push(e);
             }
         }
@@ -96,25 +96,103 @@ async fn collect_raw_events(
     events
 }
 
+/// Pruning predicate: decide whether a segment could possibly contain rows
+/// matching the plan. Uses every field of `SegmentMeta` that's relevant
+/// (review P1 #4): time range, bucket (from account_id), per-segment ID
+/// sets for product/meter/model filters, and the account_id min/max
+/// bounds. Half-open [from, to) — a segment is in range iff some event
+/// timestamp could be in [from, to), which requires
+/// `s.min < to && s.max >= from`.
+fn segment_overlaps_plan(
+    s: &SegmentMeta,
+    plan: &QueryPlan,
+    from_ms: i64,
+    to_ms: i64,
+    bucket_count: u32,
+) -> bool {
+    // Time range.
+    if !(s.min_timestamp_ms < to_ms && s.max_timestamp_ms >= from_ms) {
+        return false;
+    }
+    // Bucket from account_id.
+    if let Some(account) = &plan.account_id {
+        let target_bucket = bucket_for_account(&AccountId(account.clone()), bucket_count);
+        if s.bucket != target_bucket {
+            return false;
+        }
+        // Account name within the segment's [min, max] range.
+        if let (Some(min), Some(max)) = (&s.min_account_id, &s.max_account_id) {
+            if account < &min.0 || account > &max.0 {
+                return false;
+            }
+        }
+    }
+    // product_id / meter_id / model_id filters via SegmentMeta's ID sets.
+    if !filter_intersects(&plan.filters, "product_id", &s.product_ids, |x| &x.0) {
+        return false;
+    }
+    if !filter_intersects(&plan.filters, "meter_id", &s.meter_ids, |x| &x.0) {
+        return false;
+    }
+    if !filter_intersects(&plan.filters, "model_id", &s.model_ids, |x| &x.0) {
+        return false;
+    }
+    true
+}
+
+/// True if either (a) the plan has no filter on `field`, or (b) the
+/// segment's `ids` set contains at least one of the filter's values.
+/// `extract` extracts the inner string from each ID newtype.
+fn filter_intersects<T, F>(
+    filters: &[crate::query::plan::QueryFilter],
+    field: &str,
+    ids: &HashSet<T>,
+    extract: F,
+) -> bool
+where
+    T: std::hash::Hash + Eq,
+    F: Fn(&T) -> &String,
+{
+    let values: HashSet<&String> = filters
+        .iter()
+        .filter(|f| f.field == field)
+        .flat_map(|f| f.values.iter())
+        .collect();
+    if values.is_empty() {
+        return true;
+    }
+    ids.iter().any(|x| values.contains(extract(x)))
+}
+
 async fn collect_rollup_then_raw_tail(state: &AppState, plan: &QueryPlan) -> Vec<UsageEvent> {
-    let (watermark, rollup_paths): (i64, Vec<(std::path::PathBuf, u64)>) = {
+    // Half-open semantics throughout: rollups cover [from, min(to, watermark)),
+    // raw fallback covers [max(from, watermark), to).
+    let (watermark, rollup_upper, rollup_paths) = {
         let manifest = state.manifest.read().await;
         let wm = manifest.watermarks.hourly_rollup_ms;
-        let rollup_upper = plan.to_ms.min(wm.saturating_sub(1)); // watermark is exclusive
-        let paths = manifest
+        let rollup_upper = plan.to_ms.min(wm);
+        let paths: Vec<(std::path::PathBuf, u64)> = manifest
             .rollup_segments
             .iter()
-            .filter(|s| s.min_timestamp_ms <= rollup_upper && s.max_timestamp_ms >= plan.from_ms)
+            .filter(|s| s.min_timestamp_ms < rollup_upper && s.max_timestamp_ms >= plan.from_ms)
+            .filter(|s| {
+                // Bucket pruning for rollup segments too (review P1 #4).
+                if let Some(account) = &plan.account_id {
+                    let bc = manifest.bucket_count.max(1);
+                    s.bucket == bucket_for_account(&AccountId(account.clone()), bc)
+                } else {
+                    true
+                }
+            })
             .map(|s| (
                 state.config.db_root.join(format!("{}.rseg", s.segment_id)),
                 s.checksum,
             ))
             .collect();
-        (wm, paths)
+        (wm, rollup_upper, paths)
     };
 
     let mut events: Vec<UsageEvent> = Vec::new();
-    let rollup_upper = plan.to_ms.min(watermark.saturating_sub(1));
 
     for (path, checksum) in rollup_paths {
         if !path.exists() {
@@ -124,7 +202,7 @@ async fn collect_rollup_then_raw_tail(state: &AppState, plan: &QueryPlan) -> Vec
         match RollupSegmentReader::open(path.clone(), checksum) {
             Ok(reader) => {
                 for record in reader.into_records() {
-                    if record.hour_start_ms < plan.from_ms || record.hour_start_ms > rollup_upper {
+                    if record.hour_start_ms < plan.from_ms || record.hour_start_ms >= rollup_upper {
                         continue;
                     }
                     events.push(rollup_record_to_event(&record));
@@ -134,9 +212,8 @@ async fn collect_rollup_then_raw_tail(state: &AppState, plan: &QueryPlan) -> Vec
         }
     }
 
-    // Fall back to raw scan for the tail above the watermark, if the
-    // caller asked for it.
-    if plan.to_ms >= watermark {
+    // Raw fallback for the open-period tail [max(from, watermark), to).
+    if plan.to_ms > watermark {
         let tail_from = plan.from_ms.max(watermark);
         events.extend(collect_raw_events(state, plan, tail_from, plan.to_ms).await);
     }
@@ -233,7 +310,10 @@ fn aggregate(plan: &QueryPlan, events: &[UsageEvent]) -> Vec<Value> {
 }
 
 fn matches_plan(plan: &QueryPlan, e: &UsageEvent) -> bool {
-    if e.timestamp_ms < plan.from_ms || e.timestamp_ms > plan.to_ms {
+    // Half-open [from, to): include `from`, exclude `to`. This is the
+    // standard interval convention so adjacent monthly queries don't
+    // double-count boundary events (review P1 #5).
+    if e.timestamp_ms < plan.from_ms || e.timestamp_ms >= plan.to_ms {
         return false;
     }
     if let Some(account) = &plan.account_id {
