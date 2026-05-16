@@ -19,13 +19,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run startup recovery: load manifest, clean tmp, replay WAL
     let recovery = Recovery::new(config.db_root.clone());
-    let recovery_result = match recovery.run_startup_recovery(config.dedupe_capacity) {
+    let mut recovery_result = match recovery.run_startup_recovery(config.dedupe_capacity) {
         Ok(r) => r,
         Err(e) => {
             error!("Recovery failed: {}", e);
             return Err(e.into());
         }
     };
+
+    // First-run initialization: a fresh DB has bucket_count = 0 in its
+    // default manifest. Set it from config and persist so subsequent runs
+    // use the same value (bucket assignment is fixed for a DB's lifetime).
+    if recovery_result.manifest.bucket_count == 0 {
+        recovery_result.manifest.bucket_count = config.default_bucket_count;
+        recovery_result.manifest.save(&config.db_root)?;
+        info!("Initialized new DB with bucket_count = {}", config.default_bucket_count);
+    }
 
     let wal_dir = config.db_root.join("wal");
     let wal = Wal::open(wal_dir, recovery_result.manifest.last_sealed_wal_id)?;

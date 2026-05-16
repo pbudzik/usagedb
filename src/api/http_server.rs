@@ -59,8 +59,8 @@ async fn shutdown_signal() {
 
 struct Classified {
     event: UsageEvent,
-    event_id_hash: u64,
-    payload_hash: u64,
+    event_id_hash: crate::ingest::dedupe::EventHash,
+    payload_hash: crate::ingest::dedupe::EventHash,
 }
 
 struct IngestOutcome {
@@ -110,7 +110,7 @@ async fn ingest_critical_section(
     // Phase 1: classify (no mutation of dedupe). In-batch dedup ensures a
     // batch carrying the same event_id twice is counted as new+duplicate.
     let mut new_events: Vec<Classified> = Vec::new();
-    let mut seen_in_batch: HashMap<u64, u64> = HashMap::new();
+    let mut seen_in_batch: HashMap<crate::ingest::dedupe::EventHash, crate::ingest::dedupe::EventHash> = HashMap::new();
     let mut duplicates = 0usize;
     let mut conflicts = 0usize;
 

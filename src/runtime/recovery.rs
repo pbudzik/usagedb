@@ -110,23 +110,31 @@ impl Recovery {
     }
 }
 
-/// Hash an event for dedupe purposes. Identical to the ingest path so that
-/// replayed events match incoming retries.
-pub fn compute_event_hashes(event: &UsageEvent) -> (u64, u64) {
-    use std::hash::{Hash, Hasher};
-    use std::collections::hash_map::DefaultHasher;
+/// Hash an event for dedupe purposes. Uses blake3 to produce stable 128-bit
+/// identities; collision probability at 10^9 events is ~2^-67. The payload
+/// hash zeroes `ingested_at_ms` so that retries with a different ingest
+/// timestamp are still recognized as the same payload.
+pub fn compute_event_hashes(event: &UsageEvent) -> (crate::ingest::dedupe::EventHash, crate::ingest::dedupe::EventHash) {
+    let event_id_hash = blake3_u128(event.event_id.0.as_bytes());
 
-    let mut s1 = DefaultHasher::new();
-    event.event_id.hash(&mut s1);
-    let event_id_hash = s1.finish();
-
-    let mut s2 = DefaultHasher::new();
     let mut ev_clone = event.clone();
     ev_clone.ingested_at_ms = 0;
-    if let Ok(bytes) = bincode::serialize(&ev_clone) {
-        std::hash::Hash::hash_slice(&bytes, &mut s2);
-    }
-    let payload_hash = s2.finish();
+    let payload_hash = match bincode::serialize(&ev_clone) {
+        Ok(bytes) => blake3_u128(&bytes),
+        // bincode failure on a well-formed UsageEvent is effectively
+        // impossible (no non-serializable fields), but if it does happen
+        // we degrade to a zero hash so the event is treated as conflict-
+        // prone rather than silently deduped.
+        Err(_) => 0,
+    };
 
     (event_id_hash, payload_hash)
+}
+
+fn blake3_u128(data: &[u8]) -> u128 {
+    let hash = blake3::hash(data);
+    let bytes = hash.as_bytes();
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&bytes[..16]);
+    u128::from_le_bytes(buf)
 }

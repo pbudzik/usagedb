@@ -8,6 +8,13 @@ pub struct Config {
     pub http_bind_address: String,
     /// Maximum number of event_id hashes to keep in the hot dedupe cache.
     pub dedupe_capacity: usize,
+    /// Number of partitioning buckets per day. Fixed at DB creation time —
+    /// stored in the manifest and never changed thereafter, since bucket
+    /// assignment is `hash(account_id) % bucket_count` and changing the
+    /// modulus would invalidate every existing segment's bucket label.
+    /// Spec §5.2 recommends 64 for small installs, 256 for medium, 512+
+    /// for large.
+    pub default_bucket_count: u32,
 }
 
 impl Default for Config {
@@ -17,6 +24,7 @@ impl Default for Config {
             max_memtable_size_bytes: 64 * 1024 * 1024, // 64 MB
             http_bind_address: "127.0.0.1:8080".to_string(),
             dedupe_capacity: 1_000_000,
+            default_bucket_count: 64,
         }
     }
 }
