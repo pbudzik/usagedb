@@ -81,14 +81,17 @@ impl FlusherWorker {
                 rollback_partial(&written_paths);
                 return;
             }
-            if let Err(e) = writer.finish() {
-                error!("Failed to finish bucket {} segment {}: {}", bucket, segment_id, e);
-                let _ = std::fs::remove_file(&path);
-                rollback_partial(&written_paths);
-                return;
-            }
+            let (_row_count, checksum) = match writer.finish() {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("Failed to finish bucket {} segment {}: {}", bucket, segment_id, e);
+                    let _ = std::fs::remove_file(&path);
+                    rollback_partial(&written_paths);
+                    return;
+                }
+            };
 
-            new_metas.push(build_segment_meta(&segment_id, &bucket_events, bucket));
+            new_metas.push(build_segment_meta(&segment_id, &bucket_events, bucket, checksum));
             written_paths.push(path);
         }
 
@@ -131,8 +134,9 @@ fn rollback_partial(paths: &[PathBuf]) {
     }
 }
 
-/// Build a SegmentMeta covering all events in the batch with the given bucket.
-pub fn build_segment_meta(segment_id: &str, batch: &[UsageEvent], bucket: u32) -> SegmentMeta {
+/// Build a SegmentMeta covering all events in the batch with the given bucket
+/// and segment checksum (returned by `RawSegmentWriter::finish`).
+pub fn build_segment_meta(segment_id: &str, batch: &[UsageEvent], bucket: u32, checksum: u64) -> SegmentMeta {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     let mut min_account: Option<String> = None;
@@ -179,6 +183,6 @@ pub fn build_segment_meta(segment_id: &str, batch: &[UsageEvent], bucket: u32) -
         meter_ids,
         model_ids,
         quantity_sum: Some(quantity_sum),
-        checksum: 0, // TODO: CRC over segment bytes (waiting on columnar format)
+        checksum,
     }
 }
