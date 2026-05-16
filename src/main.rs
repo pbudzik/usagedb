@@ -27,10 +27,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let wal_path = config.db_root.join("wal.jsonl");
-    let wal = Wal::new(wal_path)?;
+    let wal_dir = config.db_root.join("wal");
+    let wal = Wal::open(wal_dir, recovery_result.manifest.last_sealed_wal_id)?;
 
-    let (flush_sender, flush_receiver) = mpsc::channel(32);
+    let (flush_sender, flush_receiver) = mpsc::channel(4);
 
     let state: AppState = Arc::new(AppStateInner {
         config,

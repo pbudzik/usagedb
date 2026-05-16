@@ -59,6 +59,12 @@ impl Memtable {
         self.approx_size_bytes = 0;
         events
     }
+
+    /// Clone the current contents for read-only access (e.g. queries scanning
+    /// unflushed data).
+    pub fn snapshot(&self) -> Vec<UsageEvent> {
+        self.events.iter().cloned().collect()
+    }
 }
 
 impl Default for Memtable {
