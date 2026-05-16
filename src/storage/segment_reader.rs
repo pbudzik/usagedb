@@ -11,10 +11,12 @@ use crate::storage::compression::{decompress, CompressionCodec};
 use crate::storage::segment_format::{checksum, col, Codec, Encoding, MAGIC, MAGIC_END, VERSION};
 
 /// Columnar segment reader. On `new()` the entire file is read, validated
-/// against the magic + checksum + end magic, and each column is
-/// decompressed into memory. `read_next()` then yields events row-by-row.
-/// Future optimization: read only the columns the caller needs by parsing
-/// the header and seeking past column payloads we don't care about.
+/// against magic + checksum + end magic, and each column is decoded
+/// (dispatching by its per-column encoding header) into memory.
+/// `read_next()` then yields events row-by-row.
+///
+/// Future optimization: parse only the column headers up front and lazily
+/// decode columns the caller actually projects.
 pub struct RawSegmentReader {
     event_id: Vec<String>,
     kind: Vec<u8>,
@@ -40,20 +42,17 @@ impl RawSegmentReader {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
 
-        // Minimum file size: header + footer with no columns.
         const HEADER_LEN: usize = MAGIC.len() + 1 + 4 + 2;
         const FOOTER_LEN: usize = 8 + MAGIC_END.len();
         if bytes.len() < HEADER_LEN + FOOTER_LEN {
             return Err(corrupt("file too small to be a segment"));
         }
 
-        // End magic.
         let end_magic_off = bytes.len() - MAGIC_END.len();
         if &bytes[end_magic_off..] != MAGIC_END {
             return Err(corrupt("missing end magic"));
         }
 
-        // Stored checksum is the 8 bytes immediately before the end magic.
         let stored_checksum_off = end_magic_off - 8;
         let stored_checksum = u64::from_le_bytes([
             bytes[stored_checksum_off],
@@ -74,30 +73,24 @@ impl RawSegmentReader {
             )));
         }
 
-        // Start magic.
         if &body[..MAGIC.len()] != MAGIC {
             return Err(corrupt("missing start magic"));
         }
         let mut off = MAGIC.len();
 
-        // Version.
         let version = body[off];
         off += 1;
         if version != VERSION {
             return Err(corrupt(&format!("unsupported segment version {}", version)));
         }
 
-        // row_count, num_columns.
         let row_count = read_u32(body, off)?;
         off += 4;
         let num_columns = read_u16(body, off)? as usize;
         off += 2;
 
-        // Walk columns. Build a name → raw bytes map; resolve into typed
-        // vectors below. The format permits columns in any order on disk
-        // (current writer uses a stable order but the reader doesn't
-        // depend on it).
-        let mut chunks: HashMap<String, Vec<u8>> = HashMap::with_capacity(num_columns);
+        // Walk columns. Each entry in the map is (encoding, decompressed bytes).
+        let mut chunks: HashMap<String, (Encoding, Vec<u8>)> = HashMap::with_capacity(num_columns);
         for _ in 0..num_columns {
             let name_len = read_u16(body, off)? as usize;
             off += 2;
@@ -109,15 +102,14 @@ impl RawSegmentReader {
                 .to_string();
             off += name_len;
 
-            let encoding = body[off];
+            let encoding_byte = body[off];
             off += 1;
-            let codec = body[off];
+            let codec_byte = body[off];
             off += 1;
-            if Encoding::from_byte(encoding) != Some(Encoding::Plain) {
-                return Err(corrupt(&format!("unsupported encoding {} for column {}", encoding, name)));
-            }
-            let codec = Codec::from_byte(codec)
-                .ok_or_else(|| corrupt(&format!("unknown codec {} for column {}", codec, name)))?;
+            let encoding = Encoding::from_byte(encoding_byte)
+                .ok_or_else(|| corrupt(&format!("unknown encoding {} for column {}", encoding_byte, name)))?;
+            let codec = Codec::from_byte(codec_byte)
+                .ok_or_else(|| corrupt(&format!("unknown codec {} for column {}", codec_byte, name)))?;
 
             let compressed_len = read_u32(body, off)? as usize;
             off += 4;
@@ -132,25 +124,24 @@ impl RawSegmentReader {
                 Codec::Zstd => decompress(compressed, CompressionCodec::Zstd)?,
                 Codec::Lz4 => decompress(compressed, CompressionCodec::Lz4)?,
             };
-            chunks.insert(name, raw);
+            chunks.insert(name, (encoding, raw));
         }
 
-        // Decode every required column. A missing column is a hard error
-        // since the writer always emits all 14.
-        let event_id: Vec<String> = de(&take(&mut chunks, col::EVENT_ID)?)?;
-        let kind: Vec<u8> = de(&take(&mut chunks, col::KIND)?)?;
-        let correction_ref: Vec<Option<CorrectionRef>> = de(&take(&mut chunks, col::CORRECTION_REF)?)?;
-        let account_id: Vec<String> = de(&take(&mut chunks, col::ACCOUNT_ID)?)?;
-        let subscription_id: Vec<Option<String>> = de(&take(&mut chunks, col::SUBSCRIPTION_ID)?)?;
-        let product_id: Vec<String> = de(&take(&mut chunks, col::PRODUCT_ID)?)?;
-        let meter_id: Vec<String> = de(&take(&mut chunks, col::METER_ID)?)?;
-        let timestamp_ms: Vec<i64> = de(&take(&mut chunks, col::TIMESTAMP_MS)?)?;
-        let quantity: Vec<i128> = de(&take(&mut chunks, col::QUANTITY)?)?;
-        let unit: Vec<String> = de(&take(&mut chunks, col::UNIT)?)?;
-        let source: Vec<String> = de(&take(&mut chunks, col::SOURCE)?)?;
-        let model_id: Vec<Option<String>> = de(&take(&mut chunks, col::MODEL_ID)?)?;
-        let dimensions: Vec<SmallDimensions> = de(&take(&mut chunks, col::DIMENSIONS)?)?;
-        let ingested_at_ms: Vec<i64> = de(&take(&mut chunks, col::INGESTED_AT_MS)?)?;
+        // Decode each required column. Dispatch by encoding.
+        let event_id: Vec<String> = decode_strings(&mut chunks, col::EVENT_ID)?;
+        let kind: Vec<u8> = decode_plain(&mut chunks, col::KIND)?;
+        let correction_ref: Vec<Option<CorrectionRef>> = decode_plain(&mut chunks, col::CORRECTION_REF)?;
+        let account_id: Vec<String> = decode_strings(&mut chunks, col::ACCOUNT_ID)?;
+        let subscription_id: Vec<Option<String>> = decode_option_strings(&mut chunks, col::SUBSCRIPTION_ID)?;
+        let product_id: Vec<String> = decode_strings(&mut chunks, col::PRODUCT_ID)?;
+        let meter_id: Vec<String> = decode_strings(&mut chunks, col::METER_ID)?;
+        let timestamp_ms: Vec<i64> = decode_i64(&mut chunks, col::TIMESTAMP_MS)?;
+        let quantity: Vec<i128> = decode_i128(&mut chunks, col::QUANTITY)?;
+        let unit: Vec<String> = decode_strings(&mut chunks, col::UNIT)?;
+        let source: Vec<String> = decode_strings(&mut chunks, col::SOURCE)?;
+        let model_id: Vec<Option<String>> = decode_option_strings(&mut chunks, col::MODEL_ID)?;
+        let dimensions: Vec<SmallDimensions> = decode_plain(&mut chunks, col::DIMENSIONS)?;
+        let ingested_at_ms: Vec<i64> = decode_i64(&mut chunks, col::INGESTED_AT_MS)?;
 
         // Row count consistency.
         let rc = row_count as usize;
@@ -259,8 +250,157 @@ fn read_u16(buf: &[u8], off: usize) -> IoResult<u16> {
     Ok(u16::from_le_bytes([buf[off], buf[off + 1]]))
 }
 
-fn take(map: &mut HashMap<String, Vec<u8>>, name: &str) -> IoResult<Vec<u8>> {
+fn take(map: &mut HashMap<String, (Encoding, Vec<u8>)>, name: &str) -> IoResult<(Encoding, Vec<u8>)> {
     map.remove(name).ok_or_else(|| corrupt(&format!("missing column {}", name)))
+}
+
+/// Decode a column that the writer chose Plain for. Errors if the on-disk
+/// encoding is something else — writers are supposed to be stable about
+/// per-column choices for a given version.
+fn decode_plain<T: serde::de::DeserializeOwned>(
+    map: &mut HashMap<String, (Encoding, Vec<u8>)>,
+    name: &str,
+) -> IoResult<Vec<T>> {
+    let (encoding, bytes) = take(map, name)?;
+    if encoding != Encoding::Plain {
+        return Err(corrupt(&format!(
+            "column {} expected Plain encoding, got {:?}",
+            name, encoding
+        )));
+    }
+    de(&bytes)
+}
+
+/// Decode a string column (`Vec<String>`). Accepts Plain or Dictionary —
+/// the reader is permissive here so a future writer change isn't a
+/// format-breaking event.
+fn decode_strings(
+    map: &mut HashMap<String, (Encoding, Vec<u8>)>,
+    name: &str,
+) -> IoResult<Vec<String>> {
+    let (encoding, bytes) = take(map, name)?;
+    match encoding {
+        Encoding::Plain => de(&bytes),
+        Encoding::Dictionary => {
+            let (dict, indices): (Vec<String>, Vec<u32>) = de(&bytes)?;
+            indices
+                .into_iter()
+                .map(|i| {
+                    dict.get(i as usize).cloned().ok_or_else(|| {
+                        corrupt(&format!("dictionary index {} out of bounds for column {}", i, name))
+                    })
+                })
+                .collect()
+        }
+        _ => Err(corrupt(&format!(
+            "column {} string-typed but on-disk encoding is {:?}",
+            name, encoding
+        ))),
+    }
+}
+
+/// Decode a nullable-string column (`Vec<Option<String>>`).
+fn decode_option_strings(
+    map: &mut HashMap<String, (Encoding, Vec<u8>)>,
+    name: &str,
+) -> IoResult<Vec<Option<String>>> {
+    let (encoding, bytes) = take(map, name)?;
+    match encoding {
+        Encoding::Plain => de(&bytes),
+        Encoding::Dictionary => {
+            let (dict, indices): (Vec<String>, Vec<Option<u32>>) = de(&bytes)?;
+            indices
+                .into_iter()
+                .map(|opt| match opt {
+                    None => Ok(None),
+                    Some(i) => dict.get(i as usize).cloned().map(Some).ok_or_else(|| {
+                        corrupt(&format!(
+                            "dictionary index {} out of bounds for column {}",
+                            i, name
+                        ))
+                    }),
+                })
+                .collect()
+        }
+        _ => Err(corrupt(&format!(
+            "column {} option-string-typed but on-disk encoding is {:?}",
+            name, encoding
+        ))),
+    }
+}
+
+/// Decode an i64 column (timestamps). Accepts Plain or Delta.
+fn decode_i64(
+    map: &mut HashMap<String, (Encoding, Vec<u8>)>,
+    name: &str,
+) -> IoResult<Vec<i64>> {
+    let (encoding, bytes) = take(map, name)?;
+    match encoding {
+        Encoding::Plain => de(&bytes),
+        Encoding::Delta => {
+            let deltas: Vec<i64> = de(&bytes)?;
+            let mut values = Vec::with_capacity(deltas.len());
+            let mut prev = 0i64;
+            for d in deltas {
+                let v = prev.wrapping_add(d);
+                values.push(v);
+                prev = v;
+            }
+            Ok(values)
+        }
+        _ => Err(corrupt(&format!(
+            "column {} i64-typed but on-disk encoding is {:?}",
+            name, encoding
+        ))),
+    }
+}
+
+/// Decode an i128 column (quantity). Accepts Plain or Zigzag-varint.
+fn decode_i128(
+    map: &mut HashMap<String, (Encoding, Vec<u8>)>,
+    name: &str,
+) -> IoResult<Vec<i128>> {
+    let (encoding, bytes) = take(map, name)?;
+    match encoding {
+        Encoding::Plain => de(&bytes),
+        Encoding::Zigzag => decode_zigzag_varint(&bytes, name),
+        _ => Err(corrupt(&format!(
+            "column {} i128-typed but on-disk encoding is {:?}",
+            name, encoding
+        ))),
+    }
+}
+
+fn decode_zigzag_varint(bytes: &[u8], name: &str) -> IoResult<Vec<i128>> {
+    if bytes.len() < 4 {
+        return Err(corrupt(&format!("column {}: zigzag payload missing count", name)));
+    }
+    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut i = 4;
+    for _ in 0..count {
+        let mut x: u128 = 0;
+        let mut shift = 0u32;
+        loop {
+            if i >= bytes.len() {
+                return Err(corrupt(&format!("column {}: zigzag varint truncated", name)));
+            }
+            let b = bytes[i];
+            i += 1;
+            x |= ((b & 0x7F) as u128) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 128 {
+                return Err(corrupt(&format!("column {}: zigzag varint overflow", name)));
+            }
+        }
+        // Zigzag-decode: u128 → i128.
+        let signed = ((x >> 1) as i128) ^ (-((x & 1) as i128));
+        out.push(signed);
+    }
+    Ok(out)
 }
 
 fn de<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> IoResult<T> {

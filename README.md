@@ -126,7 +126,7 @@ db_root/
 
 Known gaps (tracked against `rust_ai_usage_db_spec.md`):
 
-- No per-column dictionary / delta / RLE encodings yet — only `Plain` (bincode + zstd). The format reserves `Encoding` discriminants for these so they can be added without breaking compatibility.
+- No RLE encoding yet (used for `kind`-style low-cardinality columns); `Plain` + zstd handles it adequately.
 - No block-level metadata for fine-grained skipping inside a segment; pruning is segment-level only.
 - Rollup segments still use length-prefixed bincode (not the columnar format) — they're tiny so it hasn't been a win yet
 - COUNT semantics differ for `RollupHourly` queries: each rollup row counts as 1, not as the number of underlying events. Use `RawEvents` source for exact event counts.
@@ -156,7 +156,18 @@ footer:
   magic_end  b"UDBEND01"  (8 bytes)
 ```
 
-Each column payload before compression is a bincode-serialized `Vec<T>` of the column's native type, so adding a new column is additive and old readers fail loud (missing column → corrupt segment). The checksum is verified on every open.
+Each column payload before compression is encoded based on its declared `encoding` byte, then zstd-compressed:
+
+| Encoding | Layout | Used for |
+| --- | --- | --- |
+| `Plain` (0) | bincode-serialized `Vec<T>` | `event_id`, `kind`, `correction_ref`, `dimensions` |
+| `Dictionary` (1) | bincode `(Vec<String>, Vec<u32>)` — unique values + index per row | `account_id`, `product_id`, `meter_id`, `model_id`, `source`, `unit`, `subscription_id` |
+| `Delta` (2) | bincode `Vec<i64>` of running differences | `timestamp_ms`, `ingested_at_ms` |
+| `Zigzag` (3) | `u32 count` + concatenated zigzag-varints | `quantity` |
+
+Dictionary collapses ID columns from O(rows × string size) to O(unique values × string size + 4 bytes/row); for ID-heavy workloads this is a 1000× shrink on the column. Delta encoding turns near-monotonic timestamps into small differences that zstd compresses dramatically better. Zigzag-varint packs small i128 quantities into 1–2 bytes instead of 16.
+
+The reader is permissive about per-column encoding choices (the writer is allowed to change its mind), so future encoder improvements don't break older segments. Adding a column is additive and old readers fail loud (missing column → corrupt segment). The checksum is verified on every open.
 
 ## Data model
 
