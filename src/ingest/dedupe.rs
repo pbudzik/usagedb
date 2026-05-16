@@ -1,6 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Default TTL of 7 days in milliseconds, covering typical retry windows.
+const DEFAULT_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
+
 #[derive(Debug, Clone)]
 pub struct DedupeEntry {
     pub payload_hash: u64,
@@ -9,8 +12,10 @@ pub struct DedupeEntry {
 
 pub struct HotDedupe {
     cache: HashMap<u64, DedupeEntry>,
-    order: VecDeque<u64>,
+    /// Insertion order for FIFO eviction when capacity is exceeded.
+    order: VecDeque<(u64, i64)>, // (event_id_hash, inserted_at_ms)
     max_capacity: usize,
+    ttl_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,16 +25,32 @@ pub enum DedupeResult {
     PayloadConflict,
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 impl HotDedupe {
     pub fn new(max_capacity: usize) -> Self {
         Self {
             cache: HashMap::new(),
             order: VecDeque::new(),
             max_capacity,
+            ttl_ms: DEFAULT_TTL_MS,
         }
     }
 
+    pub fn with_ttl(mut self, ttl_ms: i64) -> Self {
+        self.ttl_ms = ttl_ms;
+        self
+    }
+
+    /// Check if an event is a duplicate, and insert it if new.
     pub fn check_and_insert(&mut self, event_id_hash: u64, payload_hash: u64) -> DedupeResult {
+        self.evict_expired();
+
         if let Some(existing) = self.cache.get(&event_id_hash) {
             if existing.payload_hash == payload_hash {
                 DedupeResult::ExactDuplicate
@@ -37,10 +58,7 @@ impl HotDedupe {
                 DedupeResult::PayloadConflict
             }
         } else {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
+            let now = now_ms();
             self.cache.insert(
                 event_id_hash,
                 DedupeEntry {
@@ -48,16 +66,57 @@ impl HotDedupe {
                     first_seen_ms: now,
                 },
             );
-            self.order.push_back(event_id_hash);
-            
-            if self.cache.len() > self.max_capacity {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.cache.remove(&oldest);
+            self.order.push_back((event_id_hash, now));
+
+            // Capacity-based eviction (FIFO)
+            while self.cache.len() > self.max_capacity {
+                if let Some((oldest_hash, _)) = self.order.pop_front() {
+                    self.cache.remove(&oldest_hash);
+                } else {
+                    break;
                 }
             }
-            
+
             DedupeResult::NewEvent
         }
+    }
+
+    /// Insert a known event during WAL replay without returning a dedupe result.
+    /// This rebuilds the hot cache from durable state.
+    pub fn insert_known(&mut self, event_id_hash: u64, payload_hash: u64, first_seen_ms: i64) {
+        if self.cache.contains_key(&event_id_hash) {
+            return;
+        }
+        self.cache.insert(
+            event_id_hash,
+            DedupeEntry {
+                payload_hash,
+                first_seen_ms,
+            },
+        );
+        self.order.push_back((event_id_hash, first_seen_ms));
+    }
+
+    /// Remove entries older than `ttl_ms` from the front of the insertion queue.
+    fn evict_expired(&mut self) {
+        let cutoff = now_ms() - self.ttl_ms;
+        while let Some(&(hash, inserted_at)) = self.order.front() {
+            if inserted_at < cutoff {
+                self.order.pop_front();
+                // Only remove from cache if the entry hasn't been replaced
+                if let Some(entry) = self.cache.get(&hash) {
+                    if entry.first_seen_ms < cutoff {
+                        self.cache.remove(&hash);
+                    }
+                }
+            } else {
+                break; // Order is monotonic, so we can stop early
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.cache.len()
     }
 }
 
@@ -68,7 +127,7 @@ mod tests {
     #[test]
     fn test_hot_dedupe() {
         let mut dedupe = HotDedupe::new(100);
-        
+
         // First insertion should be NewEvent
         let res1 = dedupe.check_and_insert(1234, 5678);
         assert_eq!(res1, DedupeResult::NewEvent);
@@ -85,5 +144,39 @@ mod tests {
         let res4 = dedupe.check_and_insert(4321, 5678);
         assert_eq!(res4, DedupeResult::NewEvent);
     }
-}
 
+    #[test]
+    fn test_capacity_eviction() {
+        let mut dedupe = HotDedupe::new(3);
+
+        dedupe.check_and_insert(1, 100);
+        dedupe.check_and_insert(2, 200);
+        dedupe.check_and_insert(3, 300);
+        assert_eq!(dedupe.len(), 3);
+
+        // 4th insert should evict the oldest (1)
+        dedupe.check_and_insert(4, 400);
+        assert_eq!(dedupe.len(), 3);
+
+        // Event 1 was evicted, so re-inserting is a NewEvent, not a duplicate
+        let res = dedupe.check_and_insert(1, 100);
+        assert_eq!(res, DedupeResult::NewEvent);
+    }
+
+    #[test]
+    fn test_insert_known_for_replay() {
+        let mut dedupe = HotDedupe::new(100);
+
+        let recent = now_ms() - 1000; // 1 second ago, well within TTL
+        dedupe.insert_known(1234, 5678, recent);
+        assert_eq!(dedupe.len(), 1);
+
+        // Should detect as duplicate
+        let res = dedupe.check_and_insert(1234, 5678);
+        assert_eq!(res, DedupeResult::ExactDuplicate);
+
+        // Should detect conflict
+        let res = dedupe.check_and_insert(1234, 9999);
+        assert_eq!(res, DedupeResult::PayloadConflict);
+    }
+}

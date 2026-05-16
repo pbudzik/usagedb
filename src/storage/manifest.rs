@@ -56,6 +56,9 @@ impl Manifest {
         let file = std::fs::File::open(&tmp_path)?;
         file.sync_all()?;
         std::fs::rename(tmp_path, manifest_path)?;
+        // Fsync parent directory to ensure the rename is persisted (spec §14 step 7)
+        let parent = std::fs::File::open(db_root)?;
+        parent.sync_all()?;
         Ok(())
     }
 }
