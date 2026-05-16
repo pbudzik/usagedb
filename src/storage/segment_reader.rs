@@ -1,34 +1,46 @@
 use std::fs::File;
-use std::io::{BufReader, Read, Result as IoResult};
+use std::io::Result as IoResult;
 use std::path::PathBuf;
 use crate::model::event::UsageEvent;
 use crate::model::ids::AccountId;
 use bincode;
+use memmap2::Mmap;
 
 pub struct RawSegmentReader {
-    reader: BufReader<File>,
+    _file: File, // Keep file alive
+    mmap: Mmap,
+    cursor: usize,
 }
 
 impl RawSegmentReader {
     pub fn new(path: PathBuf) -> IoResult<Self> {
         let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        Ok(Self { reader })
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self { _file: file, mmap, cursor: 0 })
     }
 
     pub fn read_next(&mut self) -> IoResult<Option<UsageEvent>> {
-        let mut len_bytes = [0u8; 4];
-        match self.reader.read_exact(&mut len_bytes) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
+        if self.cursor >= self.mmap.len() {
+            return Ok(None);
         }
-        
+
+        if self.cursor + 4 > self.mmap.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Incomplete length header"));
+        }
+
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&self.mmap[self.cursor..self.cursor + 4]);
         let len = u32::from_le_bytes(len_bytes) as usize;
-        let mut data = vec![0u8; len];
-        self.reader.read_exact(&mut data)?;
+        self.cursor += 4;
+
+        if self.cursor + len > self.mmap.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Incomplete data payload"));
+        }
+
+        let data = &self.mmap[self.cursor..self.cursor + len];
+        self.cursor += len;
         
-        let event: UsageEvent = bincode::deserialize(&data)
+        let event: UsageEvent = bincode::deserialize(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             
         Ok(Some(event))

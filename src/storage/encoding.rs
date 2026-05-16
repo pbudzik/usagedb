@@ -58,3 +58,38 @@ pub fn zigzag_encode(n: i128) -> u128 {
 pub fn zigzag_decode(n: u128) -> i128 {
     ((n >> 1) as i128) ^ (-((n & 1) as i128))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dictionary_encoder() {
+        let mut encoder = DictionaryEncoder::new();
+        let id1 = encoder.encode("apple");
+        let id2 = encoder.encode("banana");
+        let id3 = encoder.encode("apple");
+        assert_eq!(id1, 0);
+        assert_eq!(id2, 1);
+        assert_eq!(id3, 0);
+        assert_eq!(encoder.get_dictionary(), &["apple".to_string(), "banana".to_string()]);
+    }
+
+    #[test]
+    fn test_zigzag() {
+        assert_eq!(zigzag_decode(zigzag_encode(0)), 0);
+        assert_eq!(zigzag_decode(zigzag_encode(-1)), -1);
+        assert_eq!(zigzag_decode(zigzag_encode(1)), 1);
+        assert_eq!(zigzag_decode(zigzag_encode(i128::MAX)), i128::MAX);
+        assert_eq!(zigzag_decode(zigzag_encode(i128::MIN)), i128::MIN);
+    }
+
+    #[test]
+    fn test_deltas() {
+        let values = vec![1000, 1005, 1010, 1012, 1050];
+        let deltas = encode_deltas(&values);
+        let decoded = decode_deltas(&deltas);
+        assert_eq!(values, decoded);
+    }
+}
+

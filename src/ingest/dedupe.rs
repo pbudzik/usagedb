@@ -12,6 +12,7 @@ pub struct HotDedupe {
     cache: HashMap<u64, DedupeEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DedupeResult {
     NewEvent,
     ExactDuplicate,
@@ -46,3 +47,30 @@ impl HotDedupe {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hot_dedupe() {
+        let mut dedupe = HotDedupe::new();
+        
+        // First insertion should be NewEvent
+        let res1 = dedupe.check_and_insert(1234, 5678);
+        assert_eq!(res1, DedupeResult::NewEvent);
+
+        // Exact duplicate (same event_id, same payload)
+        let res2 = dedupe.check_and_insert(1234, 5678);
+        assert_eq!(res2, DedupeResult::ExactDuplicate);
+
+        // Payload conflict (same event_id, different payload)
+        let res3 = dedupe.check_and_insert(1234, 9999);
+        assert_eq!(res3, DedupeResult::PayloadConflict);
+
+        // Another new event
+        let res4 = dedupe.check_and_insert(4321, 5678);
+        assert_eq!(res4, DedupeResult::NewEvent);
+    }
+}
+
