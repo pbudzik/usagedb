@@ -57,6 +57,10 @@ pub enum Encoding {
     /// to ~1-2 bytes instead of 16; signed mapping via zigzag means
     /// `-1` ≈ same size as `1`.
     Zigzag = 3,
+    /// Run-length encoding for low-cardinality byte columns like `kind`
+    /// (3 values, almost always long runs of `Usage`). Stored as a
+    /// `Vec<(u8, u32)>` of (value, run_length) pairs.
+    Rle = 4,
 }
 
 impl Encoding {
@@ -66,6 +70,7 @@ impl Encoding {
             1 => Some(Self::Dictionary),
             2 => Some(Self::Delta),
             3 => Some(Self::Zigzag),
+            4 => Some(Self::Rle),
             _ => None,
         }
     }

@@ -115,7 +115,7 @@ async fn check_reports_manifest_summary() {
     drop(_live); // close the live state so admin can reopen cleanly
 
     let config = Config { db_root: root.clone(), ..Config::default() };
-    let state = open_state_for_admin(config).unwrap();
+    let (state, _lock) = open_state_for_admin(config).unwrap();
     let out = cmd_check(state, false).await.unwrap();
     assert!(out.contains("Raw segments:         2"), "{}", out);
     assert!(out.contains("Rollup segments:      0"), "{}", out);
@@ -131,7 +131,7 @@ async fn check_deep_passes_for_valid_segments() {
     drop(_live);
 
     let config = Config { db_root: root.clone(), ..Config::default() };
-    let state = open_state_for_admin(config).unwrap();
+    let (state, _lock) = open_state_for_admin(config).unwrap();
     let out = cmd_check(state, true).await.unwrap();
     assert!(out.contains("All segments verified"), "deep check should pass: {}", out);
 }
@@ -163,7 +163,7 @@ async fn check_deep_fails_for_corrupt_segment() {
     std::fs::write(&seg, bytes).unwrap();
 
     let config = Config { db_root: root.clone(), ..Config::default() };
-    let state = open_state_for_admin(config).unwrap();
+    let (state, _lock) = open_state_for_admin(config).unwrap();
     let err = cmd_check(state, true).await.unwrap_err();
     assert!(err.to_string().contains("failed verification"), "{}", err);
 }
@@ -202,7 +202,7 @@ async fn inspect_segment_prints_meta_and_sample_rows() {
     drop(live);
 
     let config = Config { db_root: root.clone(), ..Config::default() };
-    let state = open_state_for_admin(config).unwrap();
+    let (state, _lock) = open_state_for_admin(config).unwrap();
     let out = cmd_inspect_segment(state, &seg_id).await.unwrap();
 
     assert!(out.contains(&seg_id), "{}", out);
@@ -218,7 +218,7 @@ async fn inspect_segment_errors_for_unknown_id() {
     drop(_live);
 
     let config = Config { db_root: root.clone(), ..Config::default() };
-    let state = open_state_for_admin(config).unwrap();
+    let (state, _lock) = open_state_for_admin(config).unwrap();
     let err = cmd_inspect_segment(state, "raw_bogus").await.unwrap_err();
     assert!(err.to_string().contains("not found in manifest"), "{}", err);
 }
@@ -248,7 +248,7 @@ async fn rebuild_rollups_drops_and_rewinds() {
     drop(live);
 
     let config = Config { db_root: root.clone(), ..Config::default() };
-    let state = open_state_for_admin(config).unwrap();
+    let (state, _lock) = open_state_for_admin(config).unwrap();
     let out = cmd_rebuild_rollups(
         state.clone(),
         "1970-01-01T00:00:00Z",
@@ -269,7 +269,7 @@ async fn rebuild_rollups_rejects_invalid_dates() {
     drop(_live);
 
     let config = Config { db_root: root, ..Config::default() };
-    let state = open_state_for_admin(config).unwrap();
+    let (state, _lock) = open_state_for_admin(config).unwrap();
     let err = cmd_rebuild_rollups(state, "not-a-date", "2030-01-01T00:00:00Z")
         .await
         .unwrap_err();
@@ -298,7 +298,7 @@ async fn verify_period_reports_match_for_sealed_rollup() {
     drop(live);
 
     let config = Config { db_root: root, ..Config::default() };
-    let state = open_state_for_admin(config).unwrap();
+    let (state, _lock) = open_state_for_admin(config).unwrap();
     let out = cmd_verify_period(
         state,
         "acc_v",
@@ -327,7 +327,7 @@ async fn export_parquet_writes_file() {
 
     let out_path = root.join("export.parquet");
     let config = Config { db_root: root.clone(), ..Config::default() };
-    let state = open_state_for_admin(config).unwrap();
+    let (state, _lock) = open_state_for_admin(config).unwrap();
     let msg = cmd_export_parquet(state, &out_path).await.unwrap();
     assert!(msg.contains("Exported 2 events"), "{}", msg);
     assert!(msg.contains("2 segment(s)"), "{}", msg);

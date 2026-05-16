@@ -17,15 +17,22 @@ use crate::ingest::memtable::Memtable;
 use crate::ingest::wal::Wal;
 use crate::rollup::worker::RollupWorker;
 use crate::runtime::config::Config;
+use crate::runtime::lock::DbLock;
 use crate::runtime::state::{AppState, AppStateInner};
 use crate::storage::manifest::{Manifest, SegmentKind};
 use crate::storage::segment_reader::RawSegmentReader;
 
-/// Build a read-only AppState by loading the manifest directly. Does NOT
-/// run the full Recovery flow (no segment-scan dedupe rebuild, no WAL
-/// replay) — admin commands operate on the on-disk state as-is. Cheaper
-/// than `run_startup_recovery` for one-shot commands.
-pub fn open_state_for_admin(config: Config) -> anyhow::Result<AppState> {
+/// Build a read-only AppState by loading the manifest directly. Acquires
+/// the DB process lock at the same time and returns it as a separate
+/// guard the caller must hold for the duration of the admin operation.
+/// Does NOT run the full Recovery flow (no segment-scan dedupe rebuild,
+/// no WAL replay) — admin commands operate on the on-disk state as-is.
+///
+/// Returning `(AppState, DbLock)` rather than embedding the lock in the
+/// state keeps AppStateInner test-friendly: tests that build state
+/// manually (each with a fresh tempdir) don't need to also fake a lock.
+pub fn open_state_for_admin(config: Config) -> anyhow::Result<(AppState, DbLock)> {
+    let lock = DbLock::acquire(&config.db_root)?;
     let manifest = Manifest::load(&config.db_root)?.ok_or_else(|| {
         anyhow::anyhow!(
             "no manifest found at {:?} — run the server at least once to initialize the DB",
@@ -36,7 +43,7 @@ pub fn open_state_for_admin(config: Config) -> anyhow::Result<AppState> {
     std::fs::create_dir_all(&wal_dir)?;
     let wal = Wal::open(wal_dir, manifest.last_sealed_wal_id)?;
     let (flush_sender, _r) = tokio::sync::mpsc::channel(4);
-    Ok(Arc::new(AppStateInner {
+    let state = Arc::new(AppStateInner {
         config,
         // Minimal dedupe — admin commands don't ingest.
         dedupe: Mutex::new(HotDedupe::new(1)),
@@ -44,7 +51,8 @@ pub fn open_state_for_admin(config: Config) -> anyhow::Result<AppState> {
         memtable: Mutex::new(Memtable::new()),
         manifest: RwLock::new(manifest),
         flush_sender,
-    }))
+    });
+    Ok((state, lock))
 }
 
 /// `usagedb check [--deep]` — print manifest summary; with --deep, also

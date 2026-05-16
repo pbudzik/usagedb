@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 byteorder = "1.5.0"
 bytes = "1.11.1"
 chrono = { version = "0.4.44", features = ["serde"] }
+fs4 = "0.13"
 hyper = "1.9.0"
 lz4_flex = "0.13.1"
 memmap2 = "0.9.10"

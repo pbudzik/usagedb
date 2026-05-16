@@ -16,6 +16,7 @@ use usagedb::ingest::flusher::FlusherWorker;
 use usagedb::ingest::wal::Wal;
 use usagedb::rollup::worker::RollupWorker;
 use usagedb::runtime::config::Config;
+use usagedb::runtime::lock::DbLock;
 use usagedb::runtime::recovery::Recovery;
 use usagedb::runtime::state::{AppState, AppStateInner};
 
@@ -82,27 +83,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => run_server(config).await?,
         Command::Check { deep } => {
-            let state = open_state_for_admin(config)?;
+            let (state, _lock) = open_state_for_admin(config)?;
             let output = cmd_check(state, deep).await?;
             print!("{}", output);
         }
         Command::RebuildRollups { from, to } => {
-            let state = open_state_for_admin(config)?;
+            let (state, _lock) = open_state_for_admin(config)?;
             let output = cmd_rebuild_rollups(state, &from, &to).await?;
             print!("{}", output);
         }
         Command::InspectSegment { segment_id } => {
-            let state = open_state_for_admin(config)?;
+            let (state, _lock) = open_state_for_admin(config)?;
             let output = cmd_inspect_segment(state, &segment_id).await?;
             print!("{}", output);
         }
         Command::VerifyPeriod { account, from, to } => {
-            let state = open_state_for_admin(config)?;
+            let (state, _lock) = open_state_for_admin(config)?;
             let output = cmd_verify_period(state, &account, &from, &to).await?;
             print!("{}", output);
         }
         Command::ExportParquet { output } => {
-            let state = open_state_for_admin(config)?;
+            let (state, _lock) = open_state_for_admin(config)?;
             let output_msg = cmd_export_parquet(state, &output).await?;
             print!("{}", output_msg);
         }
@@ -113,6 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting usageDb server...");
     std::fs::create_dir_all(&config.db_root)?;
+
+    // Acquire the DB process lock for the whole server lifetime so no
+    // admin command (or second server) can race against the same db_root.
+    let _db_lock = DbLock::acquire(&config.db_root)?;
 
     // Run startup recovery: load manifest, clean tmp, replay WAL.
     let recovery = Recovery::new(config.db_root.clone());

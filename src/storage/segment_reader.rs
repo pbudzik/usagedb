@@ -129,7 +129,7 @@ impl RawSegmentReader {
 
         // Decode each required column. Dispatch by encoding.
         let event_id: Vec<String> = decode_strings(&mut chunks, col::EVENT_ID)?;
-        let kind: Vec<u8> = decode_plain(&mut chunks, col::KIND)?;
+        let kind: Vec<u8> = decode_u8(&mut chunks, col::KIND)?;
         let correction_ref: Vec<Option<CorrectionRef>> = decode_plain(&mut chunks, col::CORRECTION_REF)?;
         let account_id: Vec<String> = decode_strings(&mut chunks, col::ACCOUNT_ID)?;
         let subscription_id: Vec<Option<String>> = decode_option_strings(&mut chunks, col::SUBSCRIPTION_ID)?;
@@ -369,6 +369,44 @@ fn decode_i128(
             name, encoding
         ))),
     }
+}
+
+/// Decode a `Vec<u8>` column. Accepts Plain or Rle — the writer chose
+/// Rle for `kind` after Phase B, but Plain segments from before that
+/// still load.
+fn decode_u8(
+    map: &mut HashMap<String, (Encoding, Vec<u8>)>,
+    name: &str,
+) -> IoResult<Vec<u8>> {
+    let (encoding, bytes) = take(map, name)?;
+    match encoding {
+        Encoding::Plain => de(&bytes),
+        Encoding::Rle => decode_rle_u8(&bytes, name),
+        _ => Err(corrupt(&format!(
+            "column {} u8-typed but on-disk encoding is {:?}",
+            name, encoding
+        ))),
+    }
+}
+
+/// Expand RLE-encoded (value, run_length) pairs back to a flat Vec.
+fn decode_rle_u8(bytes: &[u8], name: &str) -> IoResult<Vec<u8>> {
+    let runs: Vec<(u8, u32)> = de(bytes)?;
+    let total: usize = runs.iter().map(|(_, c)| *c as usize).sum();
+    let mut out = Vec::with_capacity(total);
+    for (v, c) in runs {
+        // Guard against pathological run counts that would OOM us.
+        if out.len() + c as usize > 10_000_000_000 {
+            return Err(corrupt(&format!(
+                "column {} RLE run count overflows reasonable bound",
+                name
+            )));
+        }
+        for _ in 0..c {
+            out.push(v);
+        }
+    }
+    Ok(out)
 }
 
 fn decode_zigzag_varint(bytes: &[u8], name: &str) -> IoResult<Vec<i128>> {
