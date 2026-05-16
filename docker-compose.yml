@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  usagedb:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - usagedb_data:/app/data
+    environment:
+      - RUST_LOG=info
+
+volumes:
+  usagedb_data:

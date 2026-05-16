@@ -1,6 +1,6 @@
 # usageDb
 
-`usageDb` is a high-performance, embedded, append-only usage database built in Rust, optimized specifically for AI billing workloads and high-throughput metric ingestion.
+`usageDb` is a high-performance, embedded, append-only usage database built in Rust, optimized specifically for AI billing workloads and high-throughput metric ingestion in [production](https://usagebox.com/).
 
 ## Overview
 

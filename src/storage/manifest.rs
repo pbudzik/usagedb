@@ -45,3 +45,17 @@ pub struct Manifest {
     pub compacted_replacements: Vec<ReplacementRecord>,
     pub watermarks: Watermarks,
 }
+
+impl Manifest {
+    pub fn save(&self, db_root: &std::path::Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let manifest_path = db_root.join("manifest.json");
+        let tmp_path = db_root.join("manifest.json.tmp");
+        std::fs::write(&tmp_path, json)?;
+        let file = std::fs::File::open(&tmp_path)?;
+        file.sync_all()?;
+        std::fs::rename(tmp_path, manifest_path)?;
+        Ok(())
+    }
+}

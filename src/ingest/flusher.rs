@@ -33,7 +33,27 @@ impl FlusherWorker {
                         error!("Failed to finish raw segment: {}", e);
                     } else {
                         info!("Successfully flushed segment {}", segment_id);
-                        // In a complete implementation, we'd update the Manifest here
+                        
+                        let mut manifest = self.state.manifest.write().await;
+                        manifest.raw_segments.push(crate::storage::manifest::SegmentMeta {
+                            segment_id: segment_id.clone(),
+                            kind: crate::storage::manifest::SegmentKind::Raw,
+                            min_timestamp_ms: 0,
+                            max_timestamp_ms: 0,
+                            bucket: 0,
+                            row_count: batch.len() as u64,
+                            min_account_id: None,
+                            max_account_id: None,
+                            product_ids: std::collections::HashSet::new(),
+                            meter_ids: std::collections::HashSet::new(),
+                            model_ids: std::collections::HashSet::new(),
+                            quantity_sum: None,
+                            checksum: 0,
+                        });
+                        
+                        if let Err(e) = manifest.save(&self.state.config.db_root) {
+                            error!("Failed to save manifest after flush: {}", e);
+                        }
                     }
                 }
                 Err(e) => {

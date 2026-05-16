@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -7,9 +7,10 @@ pub struct DedupeEntry {
     pub first_seen_ms: i64,
 }
 
-#[derive(Default)]
 pub struct HotDedupe {
     cache: HashMap<u64, DedupeEntry>,
+    order: VecDeque<u64>,
+    max_capacity: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,8 +21,12 @@ pub enum DedupeResult {
 }
 
 impl HotDedupe {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+            max_capacity,
+        }
     }
 
     pub fn check_and_insert(&mut self, event_id_hash: u64, payload_hash: u64) -> DedupeResult {
@@ -43,6 +48,14 @@ impl HotDedupe {
                     first_seen_ms: now,
                 },
             );
+            self.order.push_back(event_id_hash);
+            
+            if self.cache.len() > self.max_capacity {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.cache.remove(&oldest);
+                }
+            }
+            
             DedupeResult::NewEvent
         }
     }
@@ -54,7 +67,7 @@ mod tests {
 
     #[test]
     fn test_hot_dedupe() {
-        let mut dedupe = HotDedupe::new();
+        let mut dedupe = HotDedupe::new(100);
         
         // First insertion should be NewEvent
         let res1 = dedupe.check_and_insert(1234, 5678);

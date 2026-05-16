@@ -6,6 +6,7 @@ use usagedb::ingest::memtable::Memtable;
 use usagedb::ingest::flusher::FlusherWorker;
 use usagedb::storage::manifest::Manifest;
 use usagedb::api::http_server::start_server;
+use usagedb::runtime::recovery::Recovery;
 
 use tokio::sync::{RwLock, Mutex, mpsc};
 use std::sync::Arc;
@@ -22,14 +23,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wal_path = config.db_root.join("wal.jsonl");
     let wal = Wal::new(wal_path)?;
 
+    let recovery = Recovery::new(config.db_root.clone());
+    let manifest = recovery.run_startup_recovery().unwrap_or_default();
+
     let (flush_sender, flush_receiver) = mpsc::channel(32);
 
     let state: AppState = Arc::new(AppStateInner {
         config,
-        dedupe: Mutex::new(HotDedupe::new()),
+        dedupe: Mutex::new(HotDedupe::new(100_000)),
         wal: Mutex::new(wal),
         memtable: Mutex::new(Memtable::new()),
-        manifest: RwLock::new(Manifest::default()),
+        manifest: RwLock::new(manifest),
         flush_sender,
     });
 

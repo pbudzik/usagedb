@@ -32,6 +32,7 @@ impl RawSegmentWriter {
 
     pub fn finish(mut self) -> IoResult<u64> {
         self.writer.flush()?;
+        self.writer.into_inner()?.sync_all()?;
         Ok(self.event_count)
     }
 }

@@ -15,8 +15,13 @@ impl Memtable {
     }
 
     pub fn insert(&mut self, event: UsageEvent) {
-        // Approximate size: static fields
-        self.approx_size_bytes += std::mem::size_of::<UsageEvent>();
+        // Approximate size: static fields + dynamic string lengths
+        let dyn_size = event.account_id.0.len()
+            + event.product_id.0.len()
+            + event.meter_id.0.len()
+            + event.model_id.as_ref().map(|m| m.0.len()).unwrap_or(0);
+            
+        self.approx_size_bytes += std::mem::size_of::<UsageEvent>() + dyn_size;
         self.events.push_back(event);
     }
 
