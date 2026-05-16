@@ -26,6 +26,17 @@ pub struct SegmentMeta {
     pub model_ids: HashSet<ModelId>,
     pub quantity_sum: Option<i128>,
     pub checksum: u64,
+    /// For rollup segments: the raw segment IDs whose events were
+    /// aggregated to produce this rollup. Empty for raw and compacted
+    /// segments (compacted segments' provenance lives in
+    /// `Manifest.compacted_replacements`).
+    ///
+    /// Spec §19.10: invoice snapshots must reference a watermark + the
+    /// source segment set. This is the per-rollup half of that — given
+    /// a rollup segment, you can name every raw segment that
+    /// contributed to it, so an invoice line's lineage is auditable.
+    #[serde(default)]
+    pub input_segment_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
