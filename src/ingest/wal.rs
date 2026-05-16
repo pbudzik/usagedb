@@ -1,18 +1,23 @@
 use std::path::{Path, PathBuf};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write, Result as IoResult};
+use std::io::{BufRead, BufReader, BufWriter, Write, Result as IoResult};
 use crate::model::event::UsageEvent;
 use tracing::{info, warn};
 
 /// Append-only write-ahead log split across numbered files. The active file
-/// (highest id) receives new appends. On `rotate`, the current file is closed
-/// and a new one with id+1 is opened; the returned id is the now-sealed file.
-/// After the flusher commits a segment containing those events, sealed files
-/// can be deleted via `delete_files_through`.
+/// (highest id) receives new appends through a BufWriter — writes are
+/// coalesced in a userspace buffer (8 KiB by default) so the kernel sees
+/// one bulk write per batch instead of one per event. `sync` flushes the
+/// buffer before fsync to maintain the durability contract.
+///
+/// On `rotate`, the buffer is flushed, the current file closed, and a new
+/// one with id+1 opened; the returned id is the now-sealed file. After the
+/// flusher commits a segment containing those events, sealed files can be
+/// deleted via `delete_files_through`.
 pub struct Wal {
     pub dir: PathBuf,
     pub active_id: u64,
-    file: File,
+    file: BufWriter<File>,
 }
 
 fn wal_filename(id: u64) -> String {
@@ -54,10 +59,16 @@ impl Wal {
             .append(true)
             .open(&path)?;
 
-        Ok(Self { dir, active_id, file })
+        Ok(Self { dir, active_id, file: BufWriter::new(file) })
     }
 
-    pub fn append_batch(&mut self, events: &[UsageEvent]) -> IoResult<()> {
+    /// Append a batch of events. Writes go through the BufWriter, so they
+    /// are not durable until `sync` (Strict mode) returns. In Fast mode
+    /// the caller skips sync and relies on OS buffering.
+    pub fn append_batch<'a, I>(&mut self, events: I) -> IoResult<()>
+    where
+        I: IntoIterator<Item = &'a UsageEvent>,
+    {
         for event in events {
             let json = serde_json::to_string(event)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -66,8 +77,18 @@ impl Wal {
         Ok(())
     }
 
-    pub fn sync(&self) -> IoResult<()> {
-        self.file.sync_data()
+    /// Flush the userspace buffer to the kernel, then fsync the file.
+    /// Required for Strict durability before acking the batch.
+    pub fn sync(&mut self) -> IoResult<()> {
+        self.file.flush()?;
+        self.file.get_ref().sync_data()
+    }
+
+    /// Flush the userspace buffer without an fsync. Used by Fast mode so
+    /// the bytes reach the kernel page cache before we ack, but we skip
+    /// the disk round-trip.
+    pub fn flush_buffer(&mut self) -> IoResult<()> {
+        self.file.flush()
     }
 
     /// Seal the current active file and open the next one. Returns the id of
@@ -75,14 +96,18 @@ impl Wal {
     /// are about to be flushed to a segment; only after segment+manifest
     /// commit should `delete_files_through(sealed_id)` be called.
     pub fn rotate(&mut self) -> IoResult<u64> {
-        self.file.sync_data()?;
+        // Drain the buffer to the sealed file before closing it, otherwise
+        // unflushed events would be dropped when the BufWriter is replaced.
+        self.file.flush()?;
+        self.file.get_ref().sync_data()?;
         let sealed_id = self.active_id;
         self.active_id += 1;
         let new_path = self.dir.join(wal_filename(self.active_id));
-        self.file = OpenOptions::new()
+        let new_file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&new_path)?;
+        self.file = BufWriter::new(new_file);
         // Fsync the directory so the new file's directory entry is durable.
         if let Ok(dir_handle) = File::open(&self.dir) {
             let _ = dir_handle.sync_all();

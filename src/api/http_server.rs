@@ -1,24 +1,37 @@
 use axum::{
     routing::{post, get},
-    Router, Json, extract::State,
+    Router, Json,
+    extract::{Path, Query, State},
     response::{IntoResponse, Response},
     http::StatusCode,
 };
-use std::net::SocketAddr;
-use tokio::net::TcpListener;
-use crate::runtime::state::{AppState, FlushMessage};
-use crate::api::http::{IngestBatchRequest, IngestBatchResponse, UsageQueryRequest};
-use crate::ingest::dedupe::DedupeResult;
-use crate::runtime::recovery::compute_event_hashes;
-use crate::model::event::UsageEvent;
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
 use tracing::{info, error};
+
+use crate::api::http::{
+    IngestBatchRequest, IngestBatchResponse, UsageQueryRequest,
+};
+use crate::ingest::dedupe::DedupeResult;
+use crate::model::event::{EventKind, UsageEvent};
+use crate::runtime::recovery::compute_event_hashes;
+use crate::runtime::state::{AppState, FlushMessage};
+use crate::runtime::config::DurabilityMode;
 
 pub async fn start_server(state: AppState) -> Result<(), std::io::Error> {
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
-        .route("/v1/ingest", post(handle_ingest))
+        // Spec §9.1 — canonical path.
+        .route("/v1/usage/batch", post(handle_ingest))
+        // Spec §12.2 — account usage with query params.
+        .route("/v1/accounts/{account_id}/usage", get(handle_account_usage))
+        // Spec §12.3 — raw audit query.
+        .route("/v1/accounts/{account_id}/usage/events", get(handle_account_events))
+        // Flexible POST query for arbitrary filter shapes.
         .route("/v1/query/json", post(handle_query_json))
+        // SQL subset endpoint.
         .route("/v1/query/sql", post(handle_query_sql))
         .with_state(state.clone());
 
@@ -57,6 +70,44 @@ async fn shutdown_signal() {
     info!("Shutdown signal received, starting graceful shutdown...");
 }
 
+/// Maximum number of dimensions per event (spec §21).
+const MAX_DIMENSIONS: usize = 16;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ValidationError {
+    MissingEventId,
+    MissingAccountId,
+    MissingProductId,
+    MissingMeterId,
+    NonPositiveTimestamp,
+    TooManyDimensions,
+    CorrectionMissingRef,
+}
+
+fn validate_event(event: &UsageEvent) -> Result<(), ValidationError> {
+    if event.event_id.0.is_empty() { return Err(ValidationError::MissingEventId); }
+    if event.account_id.0.is_empty() { return Err(ValidationError::MissingAccountId); }
+    if event.product_id.0.is_empty() { return Err(ValidationError::MissingProductId); }
+    if event.meter_id.0.is_empty() { return Err(ValidationError::MissingMeterId); }
+    if event.timestamp_ms <= 0 { return Err(ValidationError::NonPositiveTimestamp); }
+    if event.dimensions.inner.len() > MAX_DIMENSIONS {
+        return Err(ValidationError::TooManyDimensions);
+    }
+    if matches!(event.kind, EventKind::Correction | EventKind::Retraction)
+        && event.correction_ref.is_none()
+    {
+        return Err(ValidationError::CorrectionMissingRef);
+    }
+    Ok(())
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 struct Classified {
     event: UsageEvent,
     event_id_hash: crate::ingest::dedupe::EventHash,
@@ -67,6 +118,7 @@ struct IngestOutcome {
     accepted: usize,
     duplicates: usize,
     conflicts: usize,
+    rejected: usize,
     drained: Option<FlushMessage>,
 }
 
@@ -74,16 +126,24 @@ async fn handle_ingest(
     State(state): State<AppState>,
     Json(payload): Json<IngestBatchRequest>,
 ) -> Result<Json<IngestBatchResponse>, AppError> {
-    // Pre-compute hashes outside the lock.
+    // Validate + stamp ingested_at_ms server-side (so a client with a
+    // wonky clock can't poison TTL eviction). Rejected events never
+    // reach the WAL or dedupe.
+    let ingest_now = now_ms();
+    let mut rejected = 0usize;
     let mut classified: Vec<Classified> = Vec::with_capacity(payload.events.len());
-    for event in payload.events {
+    for mut event in payload.events {
+        if let Err(reason) = validate_event(&event) {
+            rejected += 1;
+            tracing::warn!(?reason, event_id = %event.event_id.0, "rejected event");
+            continue;
+        }
+        event.ingested_at_ms = ingest_now;
         let (event_id_hash, payload_hash) = compute_event_hashes(&event);
         classified.push(Classified { event, event_id_hash, payload_hash });
     }
 
-    // Critical section: classify → WAL-append-and-fsync → commit. Channel
-    // send happens after locks are dropped.
-    let outcome = ingest_critical_section(&state, classified).await?;
+    let outcome = ingest_critical_section(&state, classified, rejected).await?;
 
     if let Some(msg) = outcome.drained {
         if let Err(e) = state.flush_sender.send(msg).await {
@@ -95,20 +155,19 @@ async fn handle_ingest(
         accepted: outcome.accepted,
         duplicates: outcome.duplicates,
         conflicts: outcome.conflicts,
-        rejected: 0,
+        rejected: outcome.rejected,
     }))
 }
 
 async fn ingest_critical_section(
     state: &AppState,
     classified: Vec<Classified>,
+    rejected_before: usize,
 ) -> Result<IngestOutcome, AppError> {
     let mut dedupe = state.dedupe.lock().await;
     let mut wal = state.wal.lock().await;
     let mut memtable = state.memtable.lock().await;
 
-    // Phase 1: classify (no mutation of dedupe). In-batch dedup ensures a
-    // batch carrying the same event_id twice is counted as new+duplicate.
     let mut new_events: Vec<Classified> = Vec::new();
     let mut seen_in_batch: HashMap<crate::ingest::dedupe::EventHash, crate::ingest::dedupe::EventHash> = HashMap::new();
     let mut duplicates = 0usize;
@@ -133,26 +192,32 @@ async fn ingest_critical_section(
         }
     }
 
-    // Phase 2: durable WAL append. On error, dedupe and memtable are
-    // untouched, so the client's retry will not see false duplicates.
+    // Phase 2: durable WAL append. Per Config.durability_mode, Strict
+    // does flush+fsync, Fast only flushes the userspace buffer.
     if !new_events.is_empty() {
-        let events_for_wal: Vec<UsageEvent> =
-            new_events.iter().map(|c| c.event.clone()).collect();
-        wal.append_batch(&events_for_wal)
+        // Stream refs into append_batch — no intermediate Vec, no clones.
+        wal.append_batch(new_events.iter().map(|c| &c.event))
             .map_err(|e| AppError(anyhow::anyhow!("WAL append failed: {}", e)))?;
-        wal.sync()
-            .map_err(|e| AppError(anyhow::anyhow!("WAL sync failed: {}", e)))?;
+        match state.config.durability_mode {
+            DurabilityMode::Strict => {
+                wal.sync()
+                    .map_err(|e| AppError(anyhow::anyhow!("WAL sync failed: {}", e)))?;
+            }
+            DurabilityMode::Fast => {
+                wal.flush_buffer()
+                    .map_err(|e| AppError(anyhow::anyhow!("WAL flush failed: {}", e)))?;
+            }
+        }
     }
 
-    // Phase 3: commit dedupe and memtable.
+    // Phase 3: commit dedupe + insert into memtable (one move per event,
+    // no clone).
     let accepted = new_events.len();
     for c in new_events {
         dedupe.commit(c.event_id_hash, c.payload_hash);
         memtable.insert(c.event);
     }
 
-    // Flush trigger: drain + rotate under lock so no concurrent ingest can
-    // write into the WAL file we just sealed.
     let drained = if memtable.size_bytes() > state.config.max_memtable_size_bytes {
         info!(
             "Memtable size {} exceeds {}, rotating WAL and flushing {} events",
@@ -169,7 +234,145 @@ async fn ingest_critical_section(
         None
     };
 
-    Ok(IngestOutcome { accepted, duplicates, conflicts, drained })
+    Ok(IngestOutcome {
+        accepted,
+        duplicates,
+        conflicts,
+        rejected: rejected_before,
+        drained,
+    })
+}
+
+/// Spec §12.2 — GET /v1/accounts/{account_id}/usage. Query params:
+///   from, to       — RFC 3339 timestamps (required)
+///   group_by       — comma-separated list of group keys (optional)
+///   product_id, meter_id, model_id — equality filters (optional)
+#[derive(serde::Deserialize, Default)]
+struct UsageQueryParams {
+    from: String,
+    to: String,
+    #[serde(default)]
+    group_by: Option<String>,
+    #[serde(default)]
+    product_id: Option<String>,
+    #[serde(default)]
+    meter_id: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    source: Option<String>, // "raw" or "rollup"
+}
+
+async fn handle_account_usage(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Query(params): Query<UsageQueryParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use chrono::DateTime;
+    use crate::query::executor::execute_plan;
+    use crate::query::plan::{AggregationFunction, QueryFilter, QueryPlan, QuerySource};
+
+    let from_ms = DateTime::parse_from_rfc3339(&params.from)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| AppError(anyhow::anyhow!("invalid `from`: {}", e)))?;
+    let to_ms = DateTime::parse_from_rfc3339(&params.to)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| AppError(anyhow::anyhow!("invalid `to`: {}", e)))?;
+
+    let source = match params.source.as_deref() {
+        Some("raw") => QuerySource::RawEvents,
+        _ => QuerySource::RollupHourly,
+    };
+
+    let mut filters = Vec::new();
+    for (field, value) in [
+        ("product_id", params.product_id),
+        ("meter_id", params.meter_id),
+        ("model_id", params.model_id),
+    ] {
+        if let Some(v) = value {
+            filters.push(QueryFilter { field: field.to_string(), values: vec![v] });
+        }
+    }
+
+    let group_by: Vec<String> = params
+        .group_by
+        .as_deref()
+        .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+        .unwrap_or_default();
+
+    let mut metrics = HashMap::new();
+    metrics.insert("quantity".to_string(), AggregationFunction::Sum);
+    metrics.insert("count".to_string(), AggregationFunction::Count);
+
+    let plan = QueryPlan {
+        source,
+        account_id: Some(account_id),
+        from_ms,
+        to_ms,
+        filters,
+        group_by,
+        metrics,
+        limit: None,
+    };
+
+    let results = execute_plan(&state, &plan).await;
+    let watermark_ms = state.manifest.read().await.watermarks.hourly_rollup_ms;
+    Ok(Json(serde_json::json!({
+        "watermark_ms": watermark_ms,
+        "lines": results,
+    })))
+}
+
+/// Spec §12.3 — GET /v1/accounts/{account_id}/usage/events. Returns
+/// individual events in the time range (raw audit). Filters: meter_id.
+#[derive(serde::Deserialize, Default)]
+struct EventsQueryParams {
+    from: String,
+    to: String,
+    #[serde(default)]
+    meter_id: Option<String>,
+    #[serde(default)]
+    product_id: Option<String>,
+}
+
+async fn handle_account_events(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Query(params): Query<EventsQueryParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use chrono::DateTime;
+    use crate::query::executor::execute_plan;
+    use crate::query::plan::{QueryFilter, QueryPlan, QuerySource};
+
+    let from_ms = DateTime::parse_from_rfc3339(&params.from)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| AppError(anyhow::anyhow!("invalid `from`: {}", e)))?;
+    let to_ms = DateTime::parse_from_rfc3339(&params.to)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| AppError(anyhow::anyhow!("invalid `to`: {}", e)))?;
+
+    let mut filters = Vec::new();
+    if let Some(meter_id) = params.meter_id {
+        filters.push(QueryFilter { field: "meter_id".into(), values: vec![meter_id] });
+    }
+    if let Some(product_id) = params.product_id {
+        filters.push(QueryFilter { field: "product_id".into(), values: vec![product_id] });
+    }
+
+    let plan = QueryPlan {
+        source: QuerySource::RawEvents,
+        account_id: Some(account_id),
+        from_ms,
+        to_ms,
+        filters,
+        group_by: vec![],     // raw events, no aggregation
+        metrics: HashMap::new(),
+        limit: None,
+    };
+
+    let results = execute_plan(&state, &plan).await;
+    Ok(Json(serde_json::json!({ "events": results })))
 }
 
 async fn handle_query_json(
@@ -236,4 +439,84 @@ async fn handle_query_sql(
         .map_err(|e| AppError(anyhow::anyhow!("SQL parse error: {}", e)))?;
     let results = execute_plan(&state, &plan).await;
     Ok(Json(serde_json::json!({ "data": results })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::dimensions::SmallDimensions;
+    use crate::model::ids::{
+        AccountId, EventId, MeterId, ModelId, ProductId, SourceId, SubscriptionId, Unit,
+    };
+
+    fn good_event() -> UsageEvent {
+        UsageEvent {
+            event_id: EventId("evt".into()),
+            kind: EventKind::Usage,
+            correction_ref: None,
+            account_id: AccountId("acc".into()),
+            subscription_id: Some(SubscriptionId("sub".into())),
+            product_id: ProductId("prod".into()),
+            meter_id: MeterId("meter".into()),
+            timestamp_ms: 1,
+            quantity: 1,
+            unit: Unit("u".into()),
+            source: SourceId("src".into()),
+            model_id: Some(ModelId("mod".into())),
+            dimensions: SmallDimensions::default(),
+            ingested_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn validates_required_ids() {
+        let mut e = good_event();
+        e.event_id = EventId(String::new());
+        assert_eq!(validate_event(&e), Err(ValidationError::MissingEventId));
+
+        let mut e = good_event();
+        e.account_id = AccountId(String::new());
+        assert_eq!(validate_event(&e), Err(ValidationError::MissingAccountId));
+
+        let mut e = good_event();
+        e.product_id = ProductId(String::new());
+        assert_eq!(validate_event(&e), Err(ValidationError::MissingProductId));
+
+        let mut e = good_event();
+        e.meter_id = MeterId(String::new());
+        assert_eq!(validate_event(&e), Err(ValidationError::MissingMeterId));
+    }
+
+    #[test]
+    fn rejects_non_positive_timestamp() {
+        let mut e = good_event();
+        e.timestamp_ms = 0;
+        assert_eq!(validate_event(&e), Err(ValidationError::NonPositiveTimestamp));
+        e.timestamp_ms = -1;
+        assert_eq!(validate_event(&e), Err(ValidationError::NonPositiveTimestamp));
+    }
+
+    #[test]
+    fn rejects_dimension_overflow() {
+        let mut e = good_event();
+        for i in 0..(MAX_DIMENSIONS + 1) {
+            e.dimensions.inner.insert(format!("k{i}"), "v".into());
+        }
+        assert_eq!(validate_event(&e), Err(ValidationError::TooManyDimensions));
+    }
+
+    #[test]
+    fn requires_correction_ref_on_correction() {
+        let mut e = good_event();
+        e.kind = EventKind::Correction;
+        assert_eq!(validate_event(&e), Err(ValidationError::CorrectionMissingRef));
+
+        e.kind = EventKind::Retraction;
+        assert_eq!(validate_event(&e), Err(ValidationError::CorrectionMissingRef));
+    }
+
+    #[test]
+    fn passes_for_good_event() {
+        assert_eq!(validate_event(&good_event()), Ok(()));
+    }
 }
