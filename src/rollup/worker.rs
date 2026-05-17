@@ -258,14 +258,19 @@ impl RollupWorker {
         }
 
         // Atomically commit: append rollup segments + advance watermark.
+        // `commit_manifest` only publishes the in-memory mutation after
+        // the on-disk save succeeds, so a failure here leaves the
+        // manifest unchanged and we can safely unlink the orphaned
+        // segment files we just wrote (review P0 #2).
         let segments_written = new_segments.len();
         if segments_written > 0 || target_hour > current_watermark {
-            let mut manifest = self.state.manifest.write().await;
-            for (meta, _path) in &new_segments {
-                manifest.rollup_segments.push(meta.clone());
-            }
-            manifest.watermarks.hourly_rollup_ms = target_hour;
-            if let Err(e) = manifest.save(&self.state.config.db_root) {
+            let metas_to_commit: Vec<_> = new_segments.iter().map(|(m, _)| m.clone()).collect();
+            if let Err(e) = self.state.commit_manifest(|manifest| {
+                for meta in &metas_to_commit {
+                    manifest.rollup_segments.push(meta.clone());
+                }
+                manifest.watermarks.hourly_rollup_ms = target_hour;
+            }).await {
                 error!("rollup: manifest save failed: {} — cleaning up {} segment files", e, new_segments.len());
                 for (_meta, path) in &new_segments {
                     let _ = std::fs::remove_file(path);
@@ -299,21 +304,21 @@ impl RollupWorker {
     /// query that snapshotted the manifest can still open them. Cleanup
     /// of orphaned rollup files is a future operability task.
     pub async fn rebuild_rollups(&self, from_ms: i64, to_ms: i64) -> anyhow::Result<usize> {
-        let mut manifest = self.state.manifest.write().await;
-        let before = manifest.rollup_segments.len();
-        manifest.rollup_segments.retain(|s| {
-            // Keep segments that don't overlap [from_ms, to_ms).
-            !(s.min_timestamp_ms < to_ms && s.max_timestamp_ms >= from_ms)
-        });
-        let dropped = before - manifest.rollup_segments.len();
-
-        if manifest.watermarks.hourly_rollup_ms > from_ms {
-            manifest.watermarks.hourly_rollup_ms = from_ms;
-        }
-        manifest.save(&self.state.config.db_root)?;
+        let (dropped, new_watermark) = self.state.commit_manifest(|manifest| {
+            let before = manifest.rollup_segments.len();
+            manifest.rollup_segments.retain(|s| {
+                // Keep segments that don't overlap [from_ms, to_ms).
+                !(s.min_timestamp_ms < to_ms && s.max_timestamp_ms >= from_ms)
+            });
+            let dropped = before - manifest.rollup_segments.len();
+            if manifest.watermarks.hourly_rollup_ms > from_ms {
+                manifest.watermarks.hourly_rollup_ms = from_ms;
+            }
+            (dropped, manifest.watermarks.hourly_rollup_ms)
+        }).await?;
         info!(
             "Rebuild scheduled: dropped {} rollup segment(s) in [{}, {}); watermark rewound to {}",
-            dropped, from_ms, to_ms, manifest.watermarks.hourly_rollup_ms
+            dropped, from_ms, to_ms, new_watermark
         );
         Ok(dropped)
     }
