@@ -159,8 +159,12 @@ async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         flush_sender,
     });
 
+    let flusher_shutdown = Arc::new(Notify::new());
+    let flusher_shutdown_signal = flusher_shutdown.clone();
     let flusher = FlusherWorker::new(state.clone(), flush_receiver);
-    let flusher_handle = tokio::spawn(flusher.run());
+    let flusher_handle = tokio::spawn(async move {
+        flusher.run(flusher_shutdown_signal).await;
+    });
 
     let rollup_shutdown = Arc::new(Notify::new());
     let rollup_shutdown_signal = rollup_shutdown.clone();
@@ -219,13 +223,31 @@ async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Shutdown order matters. Producers (rollup, compaction) may still
+    // emit flush messages mid-tick; we must let them finish before we
+    // tell the flusher to drain, otherwise their final segment writes
+    // get stranded. The flusher itself holds a `flush_sender` via its
+    // own `state` clone, so we can't rely on all-senders-dropped — it
+    // needs an explicit shutdown signal (review P0 #1).
+    // Shutdown order matters. Producers (rollup, compaction) may still
+    // emit flush messages mid-tick; we must let them finish before we
+    // tell the flusher to drain, otherwise their final segment writes
+    // get stranded. The flusher itself holds a `flush_sender` via its
+    // own `state` clone, so we can't rely on all-senders-dropped — it
+    // needs an explicit shutdown signal (review P0 #1).
+    //
+    // `notify_one` (not `notify_waiters`) so the signal is stored as a
+    // permit if the worker happens to be mid-tick / mid-`handle_message`
+    // and isn't currently awaiting on the select. Without this the
+    // notification could be lost in the gap between select iterations.
     info!("Waiting for background tasks to finish...");
-    rollup_shutdown.notify_waiters();
-    compaction_shutdown.notify_waiters();
-    drop(state);
-    let _ = flusher_handle.await;
+    rollup_shutdown.notify_one();
+    compaction_shutdown.notify_one();
     let _ = rollup_handle.await;
     let _ = compaction_handle.await;
+    flusher_shutdown.notify_one();
+    let _ = flusher_handle.await;
+    drop(state);
 
     info!("Server gracefully shut down.");
     Ok(())
