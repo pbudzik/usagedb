@@ -1,5 +1,6 @@
 use crate::runtime::state::{AppState, FlushMessage};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{info, error};
 use crate::model::event::UsageEvent;
 use crate::model::ids::{AccountId, bucket_for_account};
@@ -29,10 +30,35 @@ impl FlusherWorker {
         Self { state, receiver }
     }
 
-    pub async fn run(mut self) {
+    /// Run the flusher until `shutdown` is signaled.
+    ///
+    /// The flusher's own `AppState` clone keeps a `flush_sender` alive for
+    /// the channel's lifetime, so `recv()` will never naturally return
+    /// `None` — relying on all-senders-dropped would deadlock graceful
+    /// shutdown. Callers must signal `shutdown` once no more producers
+    /// (rollup, compaction, HTTP, the shutdown-drain message) will send.
+    ///
+    /// On shutdown the loop drains any pending messages already in the
+    /// channel before exiting, so the final drain message and any
+    /// last-tick flushes from rollup/compaction still get committed.
+    pub async fn run(mut self, shutdown: Arc<Notify>) {
         info!("Background flusher started");
-        while let Some(msg) = self.receiver.recv().await {
-            self.handle_message(msg).await;
+        loop {
+            tokio::select! {
+                biased;
+                maybe = self.receiver.recv() => {
+                    match maybe {
+                        Some(msg) => self.handle_message(msg).await,
+                        None => break,
+                    }
+                }
+                _ = shutdown.notified() => {
+                    while let Ok(msg) = self.receiver.try_recv() {
+                        self.handle_message(msg).await;
+                    }
+                    break;
+                }
+            }
         }
         info!("Background flusher stopped");
     }
