@@ -104,17 +104,18 @@ impl FlusherWorker {
         }
 
         // All bucket segments are durable. Commit the manifest atomically
-        // with the WAL seal pointer.
-        let save_result = {
-            let mut manifest = self.state.manifest.write().await;
+        // with the WAL seal pointer. `commit_manifest` mutates a clone
+        // and only publishes it after the on-disk save succeeds, so a
+        // save failure leaves the in-memory manifest unchanged
+        // (review P0 #2).
+        let save_result = self.state.commit_manifest(|manifest| {
             for meta in &new_metas {
                 manifest.raw_segments.push(meta.clone());
             }
             if sealed_wal_id > manifest.last_sealed_wal_id {
                 manifest.last_sealed_wal_id = sealed_wal_id;
             }
-            manifest.save(&self.state.config.db_root)
-        };
+        }).await;
 
         if let Err(e) = save_result {
             // Manifest save failed. The segments we wrote are orphaned;

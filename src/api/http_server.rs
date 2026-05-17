@@ -737,42 +737,49 @@ async fn handle_close_period(
     let (frozen_quantity, frozen_event_count) =
         snapshot_period_totals(&state, &account_id, from_ms, to_ms).await;
 
-    let mut manifest = state.manifest.write().await;
-    // Re-check inside the write lock — another caller might have raced us.
-    if manifest.closed_periods.iter().any(|p| {
-        p.account_id == account_id && p.year == year && p.month == month
-    }) {
-        return Ok(Json(serde_json::json!({
+    // `commit_manifest_if` re-checks inside the write lock for race
+    // safety; returning `None` from the closure (already closed) skips
+    // the save and leaves the manifest unchanged (review P0 #2).
+    let closed_at_ms = now_ms();
+    let committed = state
+        .commit_manifest_if(|manifest| {
+            if manifest.closed_periods.iter().any(|p| {
+                p.account_id == account_id && p.year == year && p.month == month
+            }) {
+                return None;
+            }
+            let watermark_at_close_ms = manifest.watermarks.hourly_rollup_ms;
+            let entry = ClosedPeriod {
+                account_id: account_id.clone(),
+                year,
+                month,
+                closed_at_ms,
+                frozen_quantity: Some(frozen_quantity),
+                frozen_event_count: Some(frozen_event_count),
+                watermark_at_close_ms: Some(watermark_at_close_ms),
+            };
+            manifest.closed_periods.push(entry.clone());
+            Some((entry, watermark_at_close_ms))
+        })
+        .await
+        .map_err(|e| AppError(anyhow::anyhow!("manifest save: {}", e)))?;
+
+    match committed {
+        Some((entry, watermark_at_close_ms)) => Ok(Json(serde_json::json!({
+            "account_id": account_id,
+            "period": period,
+            "state": "Closed",
+            "closed_at_ms": closed_at_ms,
+            "watermark_at_close_ms": watermark_at_close_ms,
+            "frozen": frozen_json(&entry),
+        }))),
+        None => Ok(Json(serde_json::json!({
             "account_id": account_id,
             "period": period,
             "state": "Closed",
             "already_closed": true,
-        })));
+        }))),
     }
-    let closed_at_ms = now_ms();
-    let watermark_at_close_ms = manifest.watermarks.hourly_rollup_ms;
-    let entry = ClosedPeriod {
-        account_id: account_id.clone(),
-        year,
-        month,
-        closed_at_ms,
-        frozen_quantity: Some(frozen_quantity),
-        frozen_event_count: Some(frozen_event_count),
-        watermark_at_close_ms: Some(watermark_at_close_ms),
-    };
-    manifest.closed_periods.push(entry.clone());
-    manifest
-        .save(&state.config.db_root)
-        .map_err(|e| AppError(anyhow::anyhow!("manifest save: {}", e)))?;
-
-    Ok(Json(serde_json::json!({
-        "account_id": account_id,
-        "period": period,
-        "state": "Closed",
-        "closed_at_ms": closed_at_ms,
-        "watermark_at_close_ms": watermark_at_close_ms,
-        "frozen": frozen_json(&entry),
-    })))
 }
 
 /// Compute period bounds `[from_ms, to_ms)` from (year, month) using UTC.
@@ -859,23 +866,25 @@ async fn handle_reopen_period(
     let (year, month) = parse_period(&period)
         .map_err(|e| AppError(anyhow::anyhow!("invalid period: {}", e)))?;
 
-    let mut manifest = state.manifest.write().await;
-    let before = manifest.closed_periods.len();
-    manifest.closed_periods.retain(|p| {
-        !(p.account_id == account_id && p.year == year && p.month == month)
-    });
-    let removed = before - manifest.closed_periods.len();
-    if removed > 0 {
-        manifest
-            .save(&state.config.db_root)
-            .map_err(|e| AppError(anyhow::anyhow!("manifest save: {}", e)))?;
-    }
+    // `commit_manifest_if` only saves when something was removed,
+    // matching the prior `if removed > 0` save guard (review P0 #2).
+    let removed = state
+        .commit_manifest_if(|manifest| {
+            let before = manifest.closed_periods.len();
+            manifest.closed_periods.retain(|p| {
+                !(p.account_id == account_id && p.year == year && p.month == month)
+            });
+            let n = before - manifest.closed_periods.len();
+            if n > 0 { Some(n) } else { None }
+        })
+        .await
+        .map_err(|e| AppError(anyhow::anyhow!("manifest save: {}", e)))?;
 
     Ok(Json(serde_json::json!({
         "account_id": account_id,
         "period": period,
         "state": "Open",
-        "removed": removed > 0,
+        "removed": removed.is_some(),
     })))
 }
 

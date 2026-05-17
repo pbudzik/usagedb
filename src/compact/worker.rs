@@ -167,49 +167,43 @@ impl CompactionWorker {
             let _ = std::fs::remove_file(&idx);
         }
 
-        // Atomically swap old → new in the manifest.
-        let committed = {
-            let mut manifest = self.state.manifest.write().await;
-
-            // Defensive: every input must still be in raw_segments. If a
-            // concurrent worker (none today, but future-proofing) already
-            // removed any, abort this plan and clean up the output.
-            let input_set: HashSet<&String> = plan.segment_ids.iter().collect();
+        // Atomically swap old → new in the manifest. `commit_manifest_if`
+        // mutates a clone and only publishes after the on-disk save
+        // succeeds; the closure returns `None` if a concurrent worker
+        // already removed any of our planned inputs, leaving the
+        // manifest untouched (review P0 #2).
+        let input_set_owned: HashSet<String> = plan.segment_ids.iter().cloned().collect();
+        let committed = match self.state.commit_manifest_if(|manifest| {
+            let input_set: HashSet<&String> = input_set_owned.iter().collect();
             let still_present = manifest
                 .raw_segments
                 .iter()
                 .filter(|s| input_set.contains(&s.segment_id))
                 .count();
             if still_present != plan.segment_ids.len() {
-                warn!(
-                    "Compaction plan inputs no longer all present in manifest ({}/{}); aborting",
-                    still_present, plan.segment_ids.len()
-                );
-                drop(manifest);
-                let _ = std::fs::remove_file(&output_path);
-                return Ok(false);
+                return None;
             }
-
             manifest.raw_segments.retain(|s| !input_set.contains(&s.segment_id));
-            manifest.raw_segments.push(new_meta);
+            manifest.raw_segments.push(new_meta.clone());
             manifest.compacted_replacements.push(ReplacementRecord {
                 old_segments: plan.segment_ids.clone(),
                 new_segments: vec![output_id.clone()],
                 committed_at_ms: now_ms,
             });
-
-            match manifest.save(&self.state.config.db_root) {
-                Ok(()) => true,
-                Err(e) => {
-                    error!("Compaction manifest save failed: {} — cleaning up output", e);
-                    // Roll back the in-memory mutation by re-reading from disk
-                    // would be ideal; for now we surface the error and let
-                    // the operator deal with it. The output file we just
-                    // wrote is unreferenced; remove it.
-                    drop(manifest);
-                    let _ = std::fs::remove_file(&output_path);
-                    return Err(anyhow::anyhow!("manifest save failed: {}", e));
-                }
+            Some(still_present)
+        }).await {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                warn!(
+                    "Compaction plan inputs no longer all present in manifest; aborting"
+                );
+                let _ = std::fs::remove_file(&output_path);
+                return Ok(false);
+            }
+            Err(e) => {
+                error!("Compaction manifest save failed: {} — cleaning up output", e);
+                let _ = std::fs::remove_file(&output_path);
+                return Err(anyhow::anyhow!("manifest save failed: {}", e));
             }
         };
 
@@ -259,15 +253,15 @@ impl CompactionWorker {
         // Update the manifest to drop the finalized records. We compare by
         // (committed_at_ms, old_segments) — adequately unique since each
         // tick generates a distinct ms timestamp per record.
-        let mut manifest = self.state.manifest.write().await;
         let finalized_keys: HashSet<(i64, Vec<String>)> = to_finalize
             .iter()
             .map(|r| (r.committed_at_ms, r.old_segments.clone()))
             .collect();
-        manifest
-            .compacted_replacements
-            .retain(|r| !finalized_keys.contains(&(r.committed_at_ms, r.old_segments.clone())));
-        if let Err(e) = manifest.save(&self.state.config.db_root) {
+        if let Err(e) = self.state.commit_manifest(|manifest| {
+            manifest
+                .compacted_replacements
+                .retain(|r| !finalized_keys.contains(&(r.committed_at_ms, r.old_segments.clone())));
+        }).await {
             error!("Failed to persist replacement cleanup: {}", e);
             return Err(anyhow::anyhow!("manifest save failed: {}", e));
         }
